@@ -1,0 +1,67 @@
+# Traffic Tracking Prototype - all knobs in one place.
+# Your brother can swap models / thresholds here without touching code.
+
+model:
+  name: "yolov8n.pt"     # swap to yolov8s.pt / yolov8m.pt / custom.pt (heavy models run on GPU)
+  conf: 0.3              # min confidence 0-1. Lower = more boxes, more mistakes.
+  iou: 0.5               # merges overlapping boxes
+  imgsz: 640             # analysis size. Lower (480) = faster on CPU.
+  device: "cpu"          # "cpu" on your laptop, "cuda" / 0 on GPU
+  classes: [2, 3, 5, 7]  # COCO: 2=car, 3=motorcycle, 5=bus, 7=truck
+
+tracker:
+  name: "bytetrack.yaml" # Ultralytics tracker config (ByteTrack)
+  persist: true
+
+video:
+  source: "samples/input.mp4"
+  target: "outputs/annotated.mp4"
+  csv: "outputs/tracks.csv"
+  summary: "outputs/summary.txt"
+
+processing:
+  max_frames: -1         # -1 = all frames, else first N (quick test)
+  frame_skip: 1          # 1 = every frame, 2 = every 2nd frame (doubles speed, worse tracking)
+
+counting_line:
+  enabled: true          # legacy single line; used only if camera block removed
+  y_ratio: 0.6           # ...kept for backward compat
+  color: [0, 255, 255]   # yellow (B,G,R)
+
+camera:                  # ONE file per CCTV in production (cameras/<name>.yaml)
+  name: "demo"           # this camera's view: vehicles flow bottom -> top
+  line_a_ratio: 0.35     # upper line (exit side, top)
+  line_b_ratio: 0.65     # lower line (entry side, bottom)
+  label_a: "bottom (entry)"
+  label_b: "top (exit)"
+  color_a: [255, 0, 0]
+  color_b: [0, 255, 255]
+
+lanes_mode: "explicit"  # explicit = use lanes below; auto = guess halves (new clip); off = no lanes
+
+lanes:  # demo clip: TWO roads split by the fence/divider (diagonal in perspective)
+  # Left road = coming (top -> bottom, mostly empty). Right road = going (bottom -> top, busy).
+  - name: "left_coming"    # wedge left of fence: fence runs (0.34,0) -> (0.05,1)
+    polygon: [[0, 0], [0.34, 0], [0.05, 1], [0, 1]]
+    direction: "down"
+    allowed: []            # empty = all vehicle types allowed
+  - name: "right_going"    # everything right of fence, incl. bus bay
+    polygon: [[0.34, 0], [1.0, 0], [1.0, 1], [0.05, 1]]
+    direction: "up"
+    allowed: []
+
+outputs:
+  save_crops: true
+  crop_min_conf: 0.5
+  save_raw_frames: false   # store every Nth raw frame (brother's "frame with/without box" need)
+  save_frame_every: 30     # ...every 30th frame -> outputs/frames/raw/ + annotated/
+  frame_dir: "outputs/frames"
+
+attributes:
+  enabled: ["type"]      # add "plate" to activate OCR (needs models/lp_detector.pt + rapidocr)
+  # enabled: ["type", "plate"]
+
+plate:                   # number-plate reader (CPU: YOLO box + RapidOCR)
+  det_conf: 0.3          # plate-box threshold. Lower = more boxes, more junk OCR.
+  min_conf: 0.5          # OCR text below this is rejected as unreadable.
+  det_imgsz: 480         # detector size. Lower = faster, misses small plates.

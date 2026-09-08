@@ -1,0 +1,16 @@
+# Regenerable outputs (videos, CSVs, crops, reports) - stays local
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Auto-downloaded on first run (ultralytics fetches it)
+yolov8n.pt
+
+# OS junk
+.DS_Store
+Thumbs.db

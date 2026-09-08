@@ -1,0 +1,25 @@
+# Demo camera: TWO roads side by side (ratio polygons, 0-1, any resolution).
+# Left road = coming (top->bottom, mostly empty). Right road = going (bottom->top, busy).
+# Copy this file per CCTV in production: cameras/<name>.yaml
+# Unknown clip? Run with lanes_mode: auto (halves guess) or
+#   python tools/calibrate.py --suggest-lanes --source other.mp4
+camera:
+  name: "demo"
+  line_a_ratio: 0.35      # upper line (exit side, top)
+  line_b_ratio: 0.65      # lower line (entry side, bottom)
+  label_a: "bottom (entry)"
+  label_b: "top (exit)"
+  color_a: [255, 0, 0]
+  color_b: [0, 255, 255]
+
+lanes_mode: "explicit"
+
+lanes:  # fence/divider runs (0.34,0) -> (0.05,1). Left = coming, right = going.
+  - name: "left_coming"
+    polygon: [[0, 0], [0.34, 0], [0.05, 1], [0, 1]]
+    direction: "down"
+    allowed: []
+  - name: "right_going"
+    polygon: [[0.34, 0], [1.0, 0], [1.0, 1], [0.05, 1]]
+    direction: "up"
+    allowed: []

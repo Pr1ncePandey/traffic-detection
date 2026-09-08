@@ -1,0 +1,7 @@
+ultralytics
+opencv-python
+pandas
+tqdm
+numpy
+pyyaml
+rapidocr-onnxruntime  # number-plate OCR (CPU). Plate box: models/lp_detector.pt
