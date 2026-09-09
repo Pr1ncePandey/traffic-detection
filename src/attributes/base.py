@@ -4,7 +4,8 @@ Live now: 'type' (free from YOLO). Stubs with exact signatures: 'color',
 'plate', 'brand'. To activate a model: implement the function, add its name
 to attributes.enabled in config.yaml. No refactor needed.
 """
-from .color import extract_color  # noqa: F401  (stub, returns "" for now)
+from .color import extract_color  # noqa: F401  (kept contract -> str)
+from .color import extract_color_conf
 from .plate import configure as configure_plate  # noqa: F401
 from .plate import crop_score, read_plate, read_plate_tracked  # noqa: F401
 
@@ -16,9 +17,12 @@ def run_attributes(enabled: list, crop, vehicle: dict) -> dict:
     attrs = vehicle.setdefault("attrs", {})
     if "color" in enabled:
         try:
-            attrs["color"] = extract_color(crop) or ""
+            cname, cconf = extract_color_conf(crop)
+            if cname and float(cconf) >= float(attrs.get("color_conf", 0.0)):
+                attrs["color"] = cname
+                attrs["color_conf"] = round(float(cconf), 3)
         except Exception:
-            attrs["color"] = ""
+            pass
     if "plate" in enabled:
         try:
             h, w = crop.shape[:2]
@@ -34,5 +38,6 @@ def run_attributes(enabled: list, crop, vehicle: dict) -> dict:
     attrs.setdefault("plate_number", "")
     attrs.setdefault("plate_conf", 0.0)
     attrs.setdefault("color", attrs.get("color", ""))
+    attrs.setdefault("color_conf", attrs.get("color_conf", 0.0))
     attrs.setdefault("brand", attrs.get("brand", ""))
     return attrs

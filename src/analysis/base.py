@@ -180,7 +180,7 @@ def _load_builtins():
     if _loaded:
         return
     _loaded = True
-    from . import congestion, counting, lanes  # noqa: F401
+    from . import color_attr, congestion, counting, lanes  # noqa: F401
     try:
         from . import anpr  # noqa: F401
     except Exception as e:
