@@ -6,12 +6,9 @@ to attributes.enabled in config.yaml. No refactor needed.
 """
 from .color import extract_color  # noqa: F401  (stub, returns "" for now)
 from .plate import configure as configure_plate  # noqa: F401
-from .plate import crop_score, read_plate
-
-_configured = False
+from .plate import crop_score, read_plate, read_plate_tracked  # noqa: F401
 
 MIN_PLATE_W = 80        # skip tiny crops (CPU saving, OCR would fail anyway)
-PLATE_MAX_TRIES = 3     # OCR attempts per vehicle, best crop wins
 
 
 def run_attributes(enabled: list, crop, vehicle: dict) -> dict:
@@ -26,16 +23,12 @@ def run_attributes(enabled: list, crop, vehicle: dict) -> dict:
         try:
             h, w = crop.shape[:2]
             if w >= MIN_PLATE_W and h >= 20:
-                tries = vehicle.setdefault("_plate_tries", 0)
-                best = vehicle.setdefault("_plate_best", 0.0)
-                score = crop_score(crop)
-                if tries < PLATE_MAX_TRIES and score > best:
-                    vehicle["_plate_best"] = score
-                    vehicle["_plate_tries"] = tries + 1
-                    text, conf = read_plate(crop)
-                    if text and conf >= float(attrs.get("plate_conf", 0.0)):
-                        attrs["plate_number"] = text
-                        attrs["plate_conf"] = round(float(conf), 3)
+                # Read strategy (which frames, how many, voting) lives in
+                # plate.py so it stays driven by the plate: config block.
+                text, conf = read_plate_tracked(crop, vehicle)
+                if text:
+                    attrs["plate_number"] = text
+                    attrs["plate_conf"] = round(float(conf), 3)
         except Exception:
             pass
     attrs.setdefault("plate_number", "")

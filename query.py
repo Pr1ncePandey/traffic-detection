@@ -1,103 +1,150 @@
-"""
-query.py - answers "where did that car go?"
-Simple English: you give a vehicle ID number, it tells you when it appeared,
-how long it stayed, what type it was, and shows its frame positions.
+"""Look up objects in the SQLite record.
 
-Examples:
-  python query.py --id 3
-  python query.py --class car
   python query.py --list
-  python query.py --plate UP15FA7413
-  python query.py --plate UP15FA7413 --csv outputs/plate_test.csv
+  python query.py --id 42
+  python query.py --class truck
+  python query.py --plate HR26AF7196 [--fuzzy]
+  python query.py --group person
+  python query.py --flagged
+
+Identity note: a track id identifies an object only WITHIN one run - ByteTrack
+mints a new id for anything that leaves and re-enters. The plate is the key
+that survives across runs and cameras, which is why --plate searches every run
+while --id is scoped to one object row.
 """
 
 import argparse
 import os
-import pandas as pd
+import re
+import sqlite3
 
-CSV = "outputs/tracks.csv"
+DB = "outputs/traffic.db"
 
 
-def _norm(s: str) -> str:
-    return "".join(c for c in str(s).upper() if c.isalnum())
+def parse_args():
+    p = argparse.ArgumentParser(description="Query the traffic record")
+    p.add_argument("--db", default=DB)
+    p.add_argument("--id", type=int, default=None, help="object id")
+    p.add_argument("--track", type=int, default=None, help="ByteTrack track id")
+    p.add_argument("--class", dest="cls", default=None, help="e.g. car, truck, person")
+    p.add_argument("--group", default=None,
+                   help="vehicle | person | animal | obstacle | infrastructure")
+    p.add_argument("--plate", default=None)
+    p.add_argument("--fuzzy", action="store_true", help="tolerate up to 2 OCR typos")
+    p.add_argument("--flagged", action="store_true", help="wrong-way / wrong-lane only")
+    p.add_argument("--list", action="store_true")
+    p.add_argument("--limit", type=int, default=50)
+    return p.parse_args()
+
+
+def _norm(s) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(s or "").upper())
+
+
+def _hamming(a: str, b: str) -> int:
+    return len(a) if len(a) != len(b) else sum(x != y for x, y in zip(a, b))
+
+
+_SELECT = """
+SELECT o.*, (SELECT value FROM attributes a WHERE a.object_id=o.id
+              AND a.key='plate_number') plate,
+            (SELECT conf FROM attributes a WHERE a.object_id=o.id
+              AND a.key='plate_number') plate_conf
+FROM objects o
+"""
+
+
+def _show(conn, row):
+    print(f"\nObject #{row['id']}  (track {row['track_id']}, run {row['run_id']})")
+    print(f"  Class     : {row['cls_name']}  [{row['cls_group']}]")
+    print(f"  Seen      : {row['frames_seen']} frames, "
+          f"{(row['first_seen_s'] or 0):.2f}s -> {(row['last_seen_s'] or 0):.2f}s")
+    print(f"  Best conf : {(row['best_conf'] or 0):.3f}")
+    print(f"  Lane      : {row['lane_id'] or '-'}  flag={row['lane_flag'] or 'ok'}")
+    if row["plate"]:
+        print(f"  Plate     : {row['plate']}  (conf {(row['plate_conf'] or 0):.3f})")
+    if row["crop_path"]:
+        mark = "" if os.path.exists(row["crop_path"]) else "  [file missing]"
+        print(f"  Image     : {row['crop_path']}{mark}")
+    attrs = conn.execute("SELECT key,value,conf FROM attributes WHERE object_id=?"
+                         " AND key<>'plate_number'", (row["id"],)).fetchall()
+    if attrs:
+        print("  Attributes: " + ", ".join(
+            f"{a['key']}={a['value']}({(a['conf'] or 0):.2f})" for a in attrs))
+    for e in conn.execute("SELECT kind, ts, detail_json FROM events"
+                          " WHERE object_id=? ORDER BY ts", (row["id"],)):
+        print(f"  Event     : {e['kind']} @ {(e['ts'] or 0):.2f}s {e['detail_json'] or ''}")
+    for b in conn.execute(
+            "SELECT d.x1,d.y1,d.x2,d.y2,d.conf,f.frame_no,f.ts"
+            " FROM detections d JOIN frames f ON f.id=d.frame_id"
+            " WHERE d.object_id=? ORDER BY f.frame_no LIMIT 3", (row["id"],)):
+        print(f"  Sighting  : frame {b['frame_no']} @ {(b['ts'] or 0):.2f}s "
+              f"box=({b['x1']},{b['y1']},{b['x2']},{b['y2']}) conf={b['conf']:.2f}")
+
+
+def _table(rows):
+    if not rows:
+        print("No matches.")
+        return
+    print(f"{'id':>5} {'track':>6} {'class':<12} {'group':<14} "
+          f"{'frames':>6} {'conf':>5} {'flag':<10} plate")
+    for r in rows:
+        print(f"{r['id']:>5} {r['track_id']:>6} {str(r['cls_name'] or ''):<12} "
+              f"{str(r['cls_group'] or ''):<14} {r['frames_seen']:>6} "
+              f"{(r['best_conf'] or 0):>5.2f} {str(r['lane_flag'] or 'ok'):<10} "
+              f"{r['plate'] or ''}")
+    print(f"\n{len(rows)} row(s).")
 
 
 def main():
-    p = argparse.ArgumentParser(description="Query vehicle tracks")
-    p.add_argument("--id", type=int, default=None, help="Object ID to look up, e.g. --id 3")
-    p.add_argument("--class", dest="vclass", default=None, help="Filter by class, e.g. --class car")
-    p.add_argument("--list", action="store_true", help="List all vehicle IDs")
-    p.add_argument("--plate", default=None, help="Find vehicle by plate, e.g. --plate UP15FA7413")
-    p.add_argument("--csv", default=CSV, help="CSV file to search (default: outputs/tracks.csv)")
-    p.add_argument("--fuzzy", action="store_true",
-                   help="With --plate: tolerate up to 2-char difference (OCR typos)")
-    args = p.parse_args()
-
-    if not os.path.exists(args.csv):
-        print(f"[ERROR] {args.csv} not found. Run python main.py first.")
+    args = parse_args()
+    if not os.path.exists(args.db):
+        print(f"{args.db} not found. Run: python main.py")
         return
-    df = pd.read_csv(args.csv)
-    if df.empty:
-        print("No vehicles found.")
-        return
+    conn = sqlite3.connect(args.db)
+    conn.row_factory = sqlite3.Row
 
-    if args.plate:
+    if args.id is not None:
+        row = conn.execute(_SELECT + " WHERE o.id=?", (args.id,)).fetchone()
+        _show(conn, row) if row else print(f"No object #{args.id}.")
+    elif args.track is not None:
+        rows = conn.execute(_SELECT + " WHERE o.track_id=? ORDER BY o.run_id DESC",
+                            (args.track,)).fetchall()
+        if not rows:
+            print(f"No track {args.track}.")
+        for r in rows:
+            _show(conn, r)
+    elif args.plate:
         want = _norm(args.plate)
-        df["_pn"] = df["plate_number"].fillna("").map(_norm) if "plate_number" in df else ""
-        if args.fuzzy:
-            def close(a):
-                return len(a) == len(want) and sum(1 for x, y in zip(a, want) if x != y) <= 2
-            sub = df[df["_pn"].map(lambda a: bool(a) and (a == want or close(a)))]
-        else:
-            sub = df[df["_pn"] == want]
-        ids = sorted(sub["object_id"].unique().tolist()) if not sub.empty else []
-        if not ids:
-            print(f"No vehicle with plate '{args.plate}'. Try --fuzzy (OCR typos) or another CSV.")
-            return
-        print(f"Plate '{args.plate}' -> vehicle IDs {ids} (cross-camera identity key)")
-        for tid in ids:
-            d = sub[sub["object_id"] == tid].sort_values("frame")
-            print(f"  #{tid} {d.iloc[0]['vehicle_class']}: "
-                  f"{d.iloc[0]['time_s']}s-{d.iloc[-1]['time_s']}s, "
-                  f"frames {d.iloc[0]['frame']}-{d.iloc[-1]['frame']}, "
-                  f"read as '{d.iloc[-1]['plate_number']}'")
-        return
-
-    if args.list or (args.id is None and args.vclass is None and args.plate is None):
-        s = df.groupby("object_id").agg(
-            vehicle_class=("vehicle_class", "first"),
-            first_seen_s=("time_s", "min"), last_seen_s=("time_s", "max"),
-            frames=("frame", "count")).reset_index().sort_values("object_id")
-        print(s.to_string(index=False))
-        print(f"\nTotal unique vehicles: {len(s)}")
-        print("Tip: python query.py --id 3")
-        return
-
-    if args.vclass:
-        sub = df[df["vehicle_class"] == args.vclass]
-        ids = sorted(sub["object_id"].unique().tolist())
-        print(f"Vehicles of class '{args.vclass}': {ids} (count={len(ids)})")
-        return
-
-    sub = df[df["object_id"] == args.id].sort_values("frame")
-    if sub.empty:
-        print(f"Vehicle #{args.id} not found. Try python query.py --list")
-        return
-    print(f"=== Vehicle #{args.id} ===")
-    print(f"Class      : {sub.iloc[0]['vehicle_class']}")
-    print(f"First seen : {sub.iloc[0]['time_s']}s (frame {sub.iloc[0]['frame']})")
-    print(f"Last seen  : {sub.iloc[-1]['time_s']}s (frame {sub.iloc[-1]['frame']})")
-    print(f"Frames     : {len(sub)}")
-    print(f"Duration   : {sub.iloc[-1]['time_s'] - sub.iloc[0]['time_s']:.1f} seconds")
-    events = sub[sub["event"].isin(["IN", "OUT"])]
-    if not events.empty:
-        for _, e in events.iterrows():
-            print(f"  -> crossed line {e['event']} at {e['time_s']}s")
+        rows = conn.execute(_SELECT + " WHERE o.id IN (SELECT object_id FROM"
+                            " attributes WHERE key='plate_number')").fetchall()
+        hits = [r for r in rows
+                if _norm(r["plate"]) == want
+                or (args.fuzzy and _hamming(_norm(r["plate"]), want) <= 2)]
+        if not hits:
+            print(f"Plate {args.plate} not found"
+                  f"{'' if args.fuzzy else ' (try --fuzzy for OCR typos)'}.")
+        for r in hits:
+            _show(conn, r)
     else:
-        print("  -> did not cross the counting line (stayed on one side)")
-    print(f"Photo      : outputs/crops/vehicle_{args.id}.jpg")
-    print("\nFirst 5 positions (x1,y1,x2,y2):")
-    print(sub[["frame", "time_s", "x1", "y1", "x2", "y2", "confidence"]].head().to_string(index=False))
+        where, params = [], []
+        if args.cls:
+            where.append("LOWER(o.cls_name)=?")
+            params.append(args.cls.lower())
+        if args.group:
+            where.append("LOWER(o.cls_group)=?")
+            params.append(args.group.lower())
+        if args.flagged:
+            where.append("o.lane_flag LIKE '%wrong%'")
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        rows = conn.execute(_SELECT + clause + " ORDER BY o.id LIMIT ?",
+                            (*params, max(1, args.limit))).fetchall()
+        total = conn.execute("SELECT COUNT(*) n FROM objects o" + clause,
+                             params).fetchone()["n"]
+        _table(rows)
+        if len(rows) < total:
+            print(f"(showing {len(rows)} of {total}; raise --limit)")
+    conn.close()
 
 
 if __name__ == "__main__":

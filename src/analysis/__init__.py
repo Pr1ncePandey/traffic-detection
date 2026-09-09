@@ -1,7 +1,8 @@
-"""Frame-level analysis stubs. Vehicle writer + frame analytics run in parallel.
+"""Analysis use cases. Each is an Analyzer registered by name and enabled in
+config; the pipeline knows none of them individually.
 
-- LineCounter: IN/OUT crossing + drawing (live now).
-- SpeedEstimator / LaneMonitor / CongestionAnalyzer: stubs with fixed interfaces.
-  Next build fills them; pipeline already calls them every frame.
+Shipped: counting (zone A/B), lanes (wrong-way, wrong-lane), anpr (number
+plate), congestion (density/occupancy/motion).
 """
-from .line_counter import LineCounter  # noqa: F401
+
+from .base import ANALYZERS, Analyzer, available, build, register  # noqa: F401

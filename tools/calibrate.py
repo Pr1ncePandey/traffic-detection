@@ -1,20 +1,25 @@
-"""Calibrate a new camera: suggest zones + lane split + dominant direction from motion.
+"""Calibrate a camera from motion: lane geometry, flow direction, zone lines.
 
 Usage:
-  python tools/calibrate.py                              # uses config.yaml video source
-  python tools/calibrate.py --source some.mp4 --max-frames 600 --out cameras/new.yaml
-  python tools/calibrate.py --suggest-lanes --source other.mp4   # + lane polygons
+  python tools/calibrate.py                                  # config.yaml source
+  python tools/calibrate.py --source other.mp4 --max-frames 600
+  python tools/calibrate.py --suggest-lanes --out cameras/new.yaml
+  python tools/calibrate.py --verify --camera demo           # check, don't guess
 
-How it works (simple English):
-  1. Runs the same YOLO + ByteTrack on the first N frames.
-  2. For each vehicle ID, records start centroid -> end centroid + mean x.
-  3. dy < 0 = moved up (bottom->top). dy > 0 = moved down.
-  4. Majority vote = dominant flow. With --suggest-lanes: splits IDs by mean x
-     (left half vs right half), votes direction per half, prints two lane blocks.
-     Works for 2 separate roads AND 1 road with 2 ways (same format).
+How it works:
+  1. Runs the same YOLO + ByteTrack the pipeline runs.
+  2. Records each track's GROUND POINT (bottom-centre of the box, where the
+     vehicle meets the road) - not the box centroid, which drifts upward for a
+     vehicle whose box is clipped by the bottom edge.
+  3. Groups tracks into at most two opposing flows and, if there really are
+     two, fits the divider between them per y-band.
 
-No code change per video: save the printed block as cameras/<name>.yaml,
-then run: python main.py --camera <name>
+This shares src/analysis/lane_calibration.py with the runtime, so what this
+tool prints and what `lanes_mode: auto` does at startup cannot drift apart.
+
+--verify is the one to reach for when wrong-way alerts look wrong: it takes
+the lanes you already have and reports, per lane, the direction traffic
+actually flows in it.
 """
 
 import argparse
@@ -25,113 +30,175 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import cv2
 
+from src.analysis.geometry import describe_vector, to_ratios
+from src.analysis.lane_calibration import MotionSurvey
+from src.analysis.lane_model import LaneModel
 from src.config import load
-from src.detectors.yolo import VehicleDetector
+from src.detectors.classes import VEHICLE
+from src.detectors.yolo import Detector
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Suggest camera zones + direction from motion")
+    p = argparse.ArgumentParser(
+        description="Measure lane geometry, flow direction and zone lines")
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--source", default=None)
     p.add_argument("--max-frames", type=int, default=600)
-    p.add_argument("--out", default=None, help="write suggested cameras/<name>.yaml")
+    p.add_argument("--out", default=None, help="write cameras/<name>.yaml")
     p.add_argument("--suggest-lanes", action="store_true",
-                   help="also suggest left/right lane polygons + directions from motion")
+                   help="propose lane polygons + flow vectors from motion")
+    p.add_argument("--verify", action="store_true",
+                   help="check the CONFIGURED lanes against observed motion")
+    p.add_argument("--camera", default=None,
+                   help="with --verify: check cameras/<name>.yaml")
     return p.parse_args()
+
+
+def _camera_overlay(cfg, name):
+    """Same partial overlay main.py does, so --verify checks what will run."""
+    path = os.path.join("cameras", f"{name}.yaml")
+    if not os.path.exists(path):
+        print(f"[calibrate] cameras/{name}.yaml not found; using config.yaml")
+        return cfg
+    import yaml
+    with open(path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    for key in ("camera", "lanes", "lanes_mode", "lanes_units", "divider",
+                "lanes_rules"):
+        if key in raw:
+            if isinstance(raw[key], dict) and isinstance(cfg.get(key), dict):
+                cfg[key] = {**cfg[key], **raw[key]}
+            else:
+                cfg[key] = raw[key]
+    return cfg
+
+
+def survey_source(cfg, source, max_frames):
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {source}")
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    detector = Detector(cfg["model"])
+    rules = cfg.get("lanes_rules", {}) or {}
+    survey = MotionSurvey(
+        width, height,
+        min_samples=int(rules.get("survey_min_samples", 6)),
+        min_travel_px=float(rules.get("survey_min_travel_px", 25.0)),
+        min_travel_rel=float(rules.get("survey_min_travel_rel", 0.5)),
+        opposing_min_tracks=int(rules.get("opposing_min_tracks", 3)),
+        opposing_min_frac=float(rules.get("opposing_min_frac", 0.12)),
+        align_cos=float(rules.get("align_cos", 0.5)))
+    seen = 0
+    while seen < max_frames:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        seen += 1
+        survey.observe_frame()
+        for det in detector.detect(frame, cfg["tracker"]):
+            # Vehicles only: a pedestrian crossing the carriageway must not
+            # vote on which way the road flows.
+            if det.track_id is not None and det.group == VEHICLE:
+                survey.observe(det.track_id, det.bbox, det.cls_name)
+    cap.release()
+    print(f"[calibrate] {seen} frames, {len(survey.tracks)} tracks, "
+          f"{len(survey.moving())} with clear motion")
+    return survey, width, height, seen
+
+
+def zone_snippet(survey, width, height):
+    """The A/B counting lines, from the dominant flow."""
+    trajs = survey.moving()
+    ups = sum(1 for t in trajs if t.heading[1] < 0)
+    downs = sum(1 for t in trajs if t.heading[1] > 0)
+    if ups >= downs:
+        label_a, label_b = "bottom (entry)", "top (exit)"
+        flow = "bottom -> top"
+    else:
+        label_a, label_b = "top (entry)", "bottom (exit)"
+        flow = "top -> bottom"
+    print(f"[calibrate] dominant vertical flow: {flow} "
+          f"(up={ups} down={downs} of {len(trajs)})")
+    return (f'camera:\n  name: "new_camera"\n  line_a_ratio: 0.35\n'
+            f'  line_b_ratio: 0.65\n  label_a: "{label_a}"\n'
+            f'  label_b: "{label_b}"\n  color_a: [255, 0, 0]\n'
+            f'  color_b: [0, 255, 255]\n')
+
+
+def lanes_snippet(suggestion, width, height):
+    print(suggestion.report())
+    if not suggestion.lanes:
+        return ""
+    lines = ['\nlanes_mode: "explicit"']
+    if suggestion.divider is not None:
+        lines += ["divider:",
+                  f"  points: {to_ratios(suggestion.divider.as_points(), width, height, 4)}"]
+    lines.append("lanes:")
+    for lane in suggestion.lanes:
+        lines.append(f'  - name: "{lane["name"]}"')
+        lines.append(f"    polygon: {to_ratios(lane['polygon'], width, height, 4)}")
+        lines.append(f"    flow: [{lane['flow'][0]:.4f}, {lane['flow'][1]:.4f}]")
+        lines.append("    allowed: []")
+    if not suggestion.two_way:
+        lines.append("  # ONE carriageway: only one direction of travel was")
+        lines.append("  # observed, so no divider was invented. If a second")
+        lines.append("  # road IS in view but was empty, add it by hand with")
+        lines.append("  # tools/draw_lanes.py and give it the opposite flow.")
+    return "\n".join(lines) + "\n"
 
 
 def main():
     args = parse_args()
     cfg = load(args.config)
-    src = args.source or cfg["video"]["source"]
-    cap = cv2.VideoCapture(src)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {src}")
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    detector = VehicleDetector(cfg["model"])
-    tracks = {}  # tid -> [first_y, last_y, first_x, last_x, n]
-    n = 0
-    while n < args.max_frames:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        n += 1
-        res = detector.track(frame, cfg["tracker"])
-        if res.boxes is not None and res.boxes.id is not None:
-            boxes = res.boxes.xyxy.cpu().numpy()
-            ids = res.boxes.id.cpu().numpy().astype(int)
-            for box, tid in zip(boxes, ids):
-                x1, y1, x2, y2 = box
-                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                if tid not in tracks:
-                    tracks[tid] = [cy, cy, cx, cx, 1]
-                else:
-                    tracks[tid][1] = cy
-                    tracks[tid][3] = cx
-                    tracks[tid][4] += 1
-    cap.release()
+    if args.camera:
+        cfg = _camera_overlay(cfg, args.camera)
+    source = args.source or cfg["video"]["source"]
+    print(f"[calibrate] source {source}, up to {args.max_frames} frames")
+    survey, width, height, seen = survey_source(cfg, source, args.max_frames)
 
-    ups = downs = 0
-    for tid, (y0, y1, x0, x1, frames) in tracks.items():
-        if frames < 5:
-            continue  # ignore flicker tracks
-        if y1 < y0 - 20:
-            ups += 1
-        elif y1 > y0 + 20:
-            downs += 1
-    total = ups + downs
-    print(f"[calibrate] {len(tracks)} IDs, {total} with clear motion: up(bottom->top)={ups} down={downs}")
-    if total == 0:
-        print("Not enough motion. Try --max-frames 1200.")
+    if not survey.moving():
+        print("[calibrate] no tracks with clear motion. Try --max-frames 1200, "
+              "or check that the detector is finding vehicles at all.")
         return
-    if ups >= downs:
-        dom, la, lb = "bottom -> top", "bottom (entry)", "top (exit)"
-    else:
-        dom, la, lb = "top -> bottom", "top (entry)", "bottom (exit)"
-    print(f"[calibrate] dominant flow: {dom} ({max(ups, downs)}/{total})")
-    snippet = (f"camera:\n  name: \"new_camera\"\n  line_a_ratio: 0.35\n"
-               f"  line_b_ratio: 0.65\n  label_a: \"{la}\"\n  label_b: \"{lb}\"\n"
-               f"  color_a: [255, 0, 0]\n  color_b: [0, 255, 255]\n")
-    print("--- suggested cameras/<name>.yaml ---\n" + snippet)
+
+    if args.verify:
+        lanes_cfg = cfg.get("lanes") or []
+        if not lanes_cfg:
+            print("[calibrate] --verify needs configured lanes; none found. "
+                  "Run with --suggest-lanes instead.")
+            return
+        model = LaneModel.from_config(lanes_cfg, width, height,
+                                      divider_cfg=cfg.get("divider"),
+                                      rules=cfg.get("lanes_rules", {}))
+        print(f"[calibrate] {model.describe()}")
+        verification = survey.verify(model)
+        print(verification.report())
+        if verification.ok:
+            print("[calibrate] configured lanes agree with observed motion.")
+        else:
+            print("[calibrate] FIX THE GEOMETRY before trusting wrong-way "
+                  "alerts, or set lanes_rules.on_mismatch: flip to trust the "
+                  "measurement at runtime.")
+        return
+
+    snippet = zone_snippet(survey, width, height)
     if args.suggest_lanes:
-        left_up = left_down = right_up = right_down = 0
-        for tid, (y0, y1, x0, x1, frames) in tracks.items():
-            if frames < 5:
-                continue
-            xm = (x0 + x1) / 2 / max(W, 1)
-            moved_up = y1 < y0 - 20
-            moved_down = y1 > y0 + 20
-            if xm < 0.5:
-                if moved_up:
-                    left_up += 1
-                elif moved_down:
-                    left_down += 1
-            else:
-                if moved_up:
-                    right_up += 1
-                elif moved_down:
-                    right_down += 1
-        left_dir = "down" if left_down >= left_up else "up"
-        right_dir = "down" if right_down >= right_up else "up"
-        print(f"[lanes] left half: up={left_up} down={left_down} -> {left_dir} | "
-              f"right half: up={right_up} down={right_down} -> {right_dir}")
-        lane_block = (
-            f"\nlanes_mode: \"explicit\"\nlanes:\n"
-            f"  - name: \"left\"\n    polygon: [[0, 0], [0.48, 0], [0.48, 1], [0, 1]]\n"
-            f"    direction: \"{left_dir}\"\n    allowed: []\n"
-            f"  - name: \"right\"\n    polygon: [[0.52, 0], [1.0, 0], [1.0, 1], [0.52, 1]]\n"
-            f"    direction: \"{right_dir}\"\n    allowed: []\n")
-        print("--- suggested lanes (paste under camera block) ---" + lane_block)
-        print("Note: halves guess (0.48/0.52). If the divider is DIAGONAL in perspective "
-              "(like our demo fence), use tools/draw_lanes.py to click the real corners.")
-        snippet += lane_block
-    print("Tip: lines at 0.35/0.65 cut most lanes. Move them if a lane sits outside the band.")
+        snippet += lanes_snippet(survey.suggest(), width, height)
+    else:
+        head = survey._mean_heading(survey.moving())
+        print(f"[calibrate] mean flow {describe_vector(head)}. "
+              f"Add --suggest-lanes for lane polygons and a divider.")
+    print("--- suggested cameras/<name>.yaml ---\n" + snippet)
+    print("Tip: lines at 0.35/0.65 cut most lanes. Move them if a lane sits "
+          "outside the band.")
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
-            f.write("# Auto-suggested by tools/calibrate.py - confirm once per CCTV.\n" + snippet)
-        print(f"Saved to {args.out}. Run: python main.py --camera <name>")
+            f.write(f"# Measured by tools/calibrate.py from {source} "
+                    f"({seen} frames) - confirm once per CCTV.\n" + snippet)
+        name = os.path.splitext(os.path.basename(args.out))[0]
+        print(f"Saved to {args.out}. Run: python main.py --camera {name}")
 
 
 if __name__ == "__main__":

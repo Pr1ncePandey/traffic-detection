@@ -11,6 +11,12 @@ venv/
 # Auto-downloaded on first run (ultralytics fetches it)
 yolov8n.pt
 
+# Heavy ML weights - fetched automatically (HF) or documented in README
+*.safetensors
+*.bin
+*.onnx
+*.pth
+
 # OS junk
 .DS_Store
 Thumbs.db

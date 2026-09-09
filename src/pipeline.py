@@ -1,179 +1,355 @@
-"""Main pipeline: video -> detect -> track -> attributes -> analysis -> storage.
+"""Orchestrator: source -> sample -> detect/track -> analyzers -> storage.
 
-Parallelism: vehicle rows go to CsvStore via a background-thread queue while
-frame analytics (counts, congestion stub) runs inline per frame and frame
-snapshots (raw + annotated) are saved every N frames. Same output as before.
+Deliberately thin. It owns the loop and the order of operations, and knows
+nothing about any individual use case - analyzers are looked up by name from
+config. Adding congestion, or anything else, does not touch this file.
+
+Order matters and is load-bearing:
+  1. detect/track                  ids assigned
+  2. register tracks in the store  so analyzers can read per-object state
+  3. capture previous positions    BEFORE observe() overwrites them, or every
+                                   direction vector reads as zero
+  4. analysis stage                compute (parallelisable) -> apply -> draw,
+                                   apply/draw in config order
+  5. draw boxes, persist, evict
+
+Step 4 is one call into analysis/stage.py. The pipeline does not know how many
+analyses there are, whether any of them ran on another thread, or what they
+concluded - which is the property that lets wrong-side detection, congestion
+and ANPR be independent analyses over the same tracked objects.
 """
 
 import os
 import time
 
 import cv2
-import pandas as pd
 from tqdm import tqdm
 
-from .analysis.lanes import LaneChecker
-from .analysis.line_counter import LineCounter, ZoneCounter, check_lanes
-from .attributes.base import configure_plate, run_attributes
-from .detectors.yolo import VehicleDetector
+from .analysis import build as build_analyzers
+from .analysis.stage import AnalysisStage
+from .attributes.plate import crop_score
+from .detectors.classes import VEHICLE
+from .detectors.yolo import Detector
+from .runtime.context import FrameContext
+from .runtime.reader import FrameReader
+from .runtime.sampler import from_config as sampler_from_config
+from .runtime.source import open_source
 from .storage.csv_store import CsvStore
-from .trackers.store import TrackStore
+from .storage.frames import Reaper, build_writer
+from .storage.sqlite_store import SqliteStore
+from .trackers.store import TrackStore, ttl_for
+
+BOX_OK = (0, 255, 0)
+BOX_WRONG_WAY = (0, 0, 255)
+BOX_WRONG_LANE = (0, 165, 255)
+BOX_BY_GROUP = {"person": (255, 200, 0), "animal": (255, 0, 255),
+                "obstacle": (0, 0, 255), "infrastructure": (160, 160, 160)}
+
+
+def _box_color(det):
+    if "wrong_way" in det.lane_flag:
+        return BOX_WRONG_WAY
+    if "wrong_lane" in det.lane_flag:
+        return BOX_WRONG_LANE
+    if det.group == VEHICLE:
+        return BOX_OK
+    return BOX_BY_GROUP.get(det.group, (200, 200, 200))
+
+
+def _label(det):
+    tid = "?" if det.track_id is None else det.track_id
+    tag = f"#{tid} {det.cls_name} {det.conf:.2f}"
+    if det.lane_id:
+        tag += f" {det.lane_id}:{det.lane_flag}"
+    plate = det.extra.get("plate_number")
+    if plate:
+        tag += f" {plate}"
+    return tag
 
 
 def run_pipeline(cfg: dict) -> dict:
-    src = cfg["video"]["source"]
-    if not os.path.exists(src):
-        raise FileNotFoundError(f"Input video not found: {src}")
+    source = open_source(cfg["video"]["source"], cfg.get("source", {}))
+    info = source.info
+    W, H = info.width, info.height
+    sampler = sampler_from_config(cfg.get("processing", {}), info.fps, info.is_live)
+    reader = FrameReader(source,
+                         backpressure=cfg.get("source", {}).get("backpressure"),
+                         queue_size=cfg.get("source", {}).get("queue_size"))
 
-    os.makedirs(os.path.dirname(cfg["video"]["target"]) or ".", exist_ok=True)
-    os.makedirs("outputs/crops", exist_ok=True)
-
-    detector = VehicleDetector(cfg["model"])
+    detector = Detector(cfg["model"])
     store = TrackStore()
-    pcfg = cfg.get("plate", {})
-    configure_plate(det_conf=float(pcfg.get("det_conf", 0.4)),
-                    min_conf=float(pcfg.get("min_conf", 0.5)),
-                    det_imgsz=int(pcfg.get("det_imgsz", 480)))
-    out_cfg = cfg["outputs"]
-    frame_dir = out_cfg.get("frame_dir", "outputs/frames")
-    save_frames = bool(out_cfg.get("save_raw_frames", False))
-    every = int(out_cfg.get("save_frame_every", 30))
-    if save_frames:
-        os.makedirs(f"{frame_dir}/raw", exist_ok=True)
-        os.makedirs(f"{frame_dir}/annotated", exist_ok=True)
+    ttl = ttl_for(sampler.effective_fps, cfg.get("tracker", {}).get("track_buffer", 30))
+    evict_every = max(1, int(cfg.get("processing", {}).get("evict_every", 150)))
 
-    cap = cv2.VideoCapture(src)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {src}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    max_frames = int(cfg["processing"].get("max_frames", -1))
-    frame_skip = max(1, int(cfg["processing"].get("frame_skip", 1)))
-    if max_frames > 0:
-        total = min(total, max_frames // frame_skip + 1)
+    st_cfg = cfg.get("storage", {})
+    storage = SqliteStore(st_cfg.get("path", "outputs/traffic.db"),
+                          batch_rows=st_cfg.get("batch_rows"),
+                          commit_interval=st_cfg.get("commit_interval"))
+    storage.start_run({"source": str(cfg["video"]["source"]),
+                       "camera": cfg.get("camera", {}).get("name", ""),
+                       "fps": info.fps, "width": W, "height": H,
+                       "analyse_fps": sampler.effective_fps, "config": cfg})
 
-    line = LineCounter(cfg.get("counting_line", {}), H)
-    zone = ZoneCounter(cfg.get("camera", {}), H, legacy=cfg.get("counting_line", {}))
-    # --no-line / enabled:false hides both lines.
-    if not line.enabled:
-        zone.enabled = False
-    lanes_mode = str(cfg.get("lanes_mode", "explicit")).lower()
-    checker = LaneChecker(cfg.get("lanes", []), W, H, mode=lanes_mode)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(cfg["video"]["target"], fourcc, fps, (W, H))
-    csv = CsvStore(cfg["video"]["csv"])
+    fr_cfg = cfg.get("frames", {}) or {}
+    save_frames = bool(fr_cfg.get("enabled", True))
+    writer = build_writer(fr_cfg, sampler.effective_fps, (W, H)) if save_frames else None
+    ret = fr_cfg.get("retention", {}) or {}
+    reaper = Reaper(storage, max_age_hours=ret.get("max_age_hours", 0),
+                    max_disk_gb=ret.get("max_disk_gb", 0),
+                    interval=ret.get("check_interval", 60),
+                    usage_fn=(lambda: writer.bytes_written) if writer else None)
+    if reaper.enabled:
+        reaper.reconcile()
+        reaper.start()
 
-    cam = cfg.get("camera", {})
-    print(f"[pipeline] {W}x{H} @ {fps:.1f}fps | model={cfg['model']['name']} "
-          f"conf={cfg['model']['conf']} device={cfg['model'].get('device', 'cpu')} | "
-          f"zones A@{zone.b_ratio:.2f}({cam.get('label_a', 'entry')}) "
-          f"B@{zone.a_ratio:.2f}({cam.get('label_b', 'exit')}) "
-          f"{'on' if zone.enabled else 'off'} | "
-          f"lanes={lanes_mode}({len(checker.lanes)}): " +
-          ", ".join(f"{L['name']}:{L['direction']}" for L in checker.lanes))
+    obj_cfg = cfg.get("objects", {}) or {}
+    crop_dir = obj_cfg.get("crop_dir", "outputs/crops")
+    save_crops = bool(obj_cfg.get("save_crops", True))
+    crop_min_conf = float(obj_cfg.get("crop_min_conf", 0.5))
+    if save_crops:
+        os.makedirs(crop_dir, exist_ok=True)
+
+    analyzers = build_analyzers(cfg.get("analyzers", []), cfg, info)
+    an_cfg = cfg.get("analysis", {}) or {}
+    # The stage owns phase order and threading; see analysis/stage.py for why
+    # `parallel` is opt-in rather than the default.
+    stage = AnalysisStage(analyzers,
+                          parallel=bool(an_cfg.get("parallel", False)),
+                          workers=an_cfg.get("workers"))
+
+    out = None
+    if cfg["video"].get("write_video", True):
+        os.makedirs(os.path.dirname(cfg["video"]["target"]) or ".", exist_ok=True)
+        out = cv2.VideoWriter(cfg["video"]["target"], cv2.VideoWriter_fourcc(*"mp4v"),
+                              sampler.effective_fps, (W, H))
+    csv = CsvStore(cfg["video"]["csv"]) if st_cfg.get("csv_export", True) else None
+
+    print(f"[pipeline] {info.label}")
+    print(f"[pipeline] {detector.describe()}")
+    print(f"[pipeline] sampling {sampler.describe()} | reader {reader.describe()}")
+    print(f"[pipeline] analysis: {stage.describe()}")
+    print(f"[pipeline] frames={fr_cfg.get('format') if save_frames else 'off'} "
+          f"| db={st_cfg.get('path')} | track ttl={ttl:.1f}s")
+
+    max_frames = int(cfg.get("processing", {}).get("max_frames", -1))
+    total = None
+    if info.total_frames and not info.is_live:
+        total = int(info.total_frames / max(1.0, info.fps / sampler.effective_fps))
+        if max_frames > 0:
+            total = min(total, max_frames)
 
     start = time.time()
-    frame_no, seen = 0, 0
-    pbar = tqdm(total=total if total > 0 else None, desc="Processing")
-    while True:
-        ret, raw = cap.read()
-        if ret:
-            frame_no += 1
-        if not ret:
-            break
-        if max_frames > 0 and frame_no > max_frames:
-            break
-        if (frame_no - 1) % frame_skip != 0:
+    read_n = analysed = 0
+    pbar = tqdm(total=total, desc="Processing")
+    reader.start()
+    try:
+        for index, raw in reader.frames():
+            read_n = index + 1
+            if not sampler.should_process(index):
+                continue
+            if max_frames > 0 and analysed >= max_frames:
+                break
+            analysed += 1
+            timestamp = (time.time() if info.is_live
+                         else (index / info.fps if info.fps else index))
+            annotated = raw.copy()
+            detections = detector.detect(raw, cfg["tracker"])
+
+            for det in detections:
+                if det.track_id is None:
+                    continue
+                store.touch(det.track_id, det.cls_name, timestamp,
+                            group=det.group, conf=det.conf)
+                if det.track_id not in store.object_ids:
+                    store.object_ids[det.track_id] = storage.next_object_id()
+                cx, cy = det.centroid
+                # Capture the PREVIOUS position before observe() replaces it.
+                det.extra["prev_xy"] = store.observe(det.track_id, cx, cy)
+
+            ctx = FrameContext(frame_no=analysed, timestamp=timestamp, raw=raw,
+                               annotated=annotated, detections=detections,
+                               store=store, source=info)
+            stage.run(ctx)
+
+            for det in detections:
+                color = _box_color(det)
+                x1, y1, x2, y2 = det.bbox
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(annotated, _label(det), (x1, max(12, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+            frame_id = storage.next_frame_id()
+            ctx.frame_id = frame_id
+            meta = ({"raw_path": None, "annotated_path": None, "segment_id": None,
+                     "frame_offset": None, "bytes": None} if writer is None
+                    else writer.write_pair(analysed, timestamp, raw, annotated))
+            storage.put_frame({"id": frame_id, "frame_no": analysed,
+                               "ts": timestamp, **meta})
+
+            for det in detections:
+                oid = store.object_ids.get(det.track_id)
+                storage.put_detection({
+                    "frame_id": frame_id, "object_id": oid,
+                    "x1": det.bbox[0], "y1": det.bbox[1],
+                    "x2": det.bbox[2], "y2": det.bbox[3],
+                    "conf": round(det.conf, 3), "cls_name": det.cls_name,
+                    "event": det.event or "", "lane_id": det.lane_id or "",
+                    "lane_flag": det.lane_flag or ""})
+                if csv is not None:
+                    csv.put({"frame": analysed, "time_s": round(timestamp, 2),
+                             "object_id": det.track_id, "vehicle_class": det.cls_name,
+                             "cls_group": det.group, "confidence": round(det.conf, 3),
+                             "x1": det.bbox[0], "y1": det.bbox[1],
+                             "x2": det.bbox[2], "y2": det.bbox[3],
+                             "event": det.event or "", "lane_id": det.lane_id or "",
+                             "lane_flag": det.lane_flag or "",
+                             "plate_number": det.extra.get("plate_number", ""),
+                             "plate_conf": det.extra.get("plate_conf", 0.0)})
+                if det.track_id is None or oid is None:
+                    continue
+                _keep_best_crop(store, det, raw, crop_dir, save_crops, crop_min_conf)
+
+            for ev in ctx.events:
+                storage.put_event({"frame_id": frame_id,
+                                   "object_id": store.object_ids.get(ev["track_id"]),
+                                   "kind": ev["kind"], "detail_json": ev["detail"],
+                                   "ts": ev["ts"]})
+
+            if analysed % evict_every == 0:
+                store.evict_stale(timestamp, ttl,
+                                  on_evict=lambda t, v: _finalize(storage, store,
+                                                                  stage, t, v))
+            if out is not None:
+                out.write(annotated)
+            pbar.update(1)
+    except KeyboardInterrupt:
+        print("\n[pipeline] interrupted; flushing what has been analysed")
+    finally:
+        pbar.close()
+        reader.stop()
+        source.release()
+        # Everything still tracked at shutdown must be written, or the last
+        # objects of a run would exist only in memory.
+        for tid, vehicle in list(store.vehicles.items()):
+            _finalize(storage, store, stage, tid, vehicle)
+        stage.close()
+        if writer is not None:
+            writer.close()
+        reaper.stop()
+        if out is not None:
+            out.release()
+        storage.flush()
+        df = csv.close() if csv is not None else None
+
+    elapsed = max(1e-6, time.time() - start)
+    summaries = stage.summaries()
+    _write_summary(cfg, info, store, elapsed, read_n, analysed, summaries, writer)
+    storage.close()
+
+    print(f"[done] {elapsed:.1f}s | read={read_n} analysed={analysed} "
+          f"({analysed/elapsed:.1f} fps) | tracks={len(store.object_ids) + store.evicted} "
+          f"| A->B={store.a_to_b} B->A={store.b_to_a} "
+          f"| dropped={reader.frames_dropped} | rows={storage.rows_written}")
+    return {"frames": analysed, "read": read_n, "df": df, "store": store,
+            "db": st_cfg.get("path"), "summaries": summaries}
+
+
+def _keep_best_crop(store, det, raw, crop_dir, save_crops, min_conf):
+    """One image per object, the sharpest seen rather than the first.
+
+    The original kept whichever crop appeared first above the threshold and
+    latched it forever, which for an approaching vehicle is its smallest and
+    blurriest view.
+    """
+    if not save_crops:
+        return
+    x1, y1, x2, y2 = det.bbox
+    crop = raw[y1:y2, x1:x2]
+    if crop.size == 0:
+        return
+    vehicle = store.vehicles.get(det.track_id)
+    if vehicle is None:
+        return
+    have = vehicle.get("_crop_path") is not None
+    # Below the confidence bar we still take a first image (so every object has
+    # one) but never overwrite an image taken above it.
+    if have and det.conf < min_conf:
+        return
+    score = crop_score(crop)
+    if have and score <= float(vehicle.get("_crop_score", 0.0)):
+        return
+    vehicle["_crop_score"] = score if det.conf >= min_conf else 0.0
+    path = os.path.join(crop_dir, f"object_{store.object_ids[det.track_id]}.jpg")
+    try:
+        cv2.imwrite(path, crop)
+        vehicle["_crop_path"] = path
+    except Exception as e:
+        print(f"[pipeline] crop write failed {path}: {e}")
+
+
+# attrs uses a shorter confidence key than the value key for plates
+# ("plate_number" pairs with "plate_conf", not "plate_number_conf").
+_CONF_KEY = {"plate_number": "plate_conf"}
+
+
+def _attr_conf(attrs: dict, key: str) -> float:
+    for candidate in (_CONF_KEY.get(key), f"{key}_conf"):
+        if candidate and candidate in attrs:
+            try:
+                return float(attrs[candidate] or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def _finalize(storage, store, stage, tid, vehicle):
+    """Persist an object row plus its attributes, then let analyzers forget it."""
+    oid = store.object_ids.get(tid)
+    if oid is None:
+        return
+    storage.upsert_object({
+        "id": oid, "track_id": tid,
+        "cls_name": vehicle.get("vehicle_class", ""),
+        "cls_group": vehicle.get("cls_group", ""),
+        "first_seen_s": vehicle.get("first_seen_s", 0.0),
+        "last_seen_s": vehicle.get("last_seen_s", 0.0),
+        "frames_seen": vehicle.get("frames_seen", 0),
+        "best_conf": vehicle.get("best_conf", 0.0),
+        "crop_path": vehicle.get("_crop_path"),
+        "lane_id": store.lane_of.get(tid),
+        "lane_flag": store.lane_flag_of.get(tid)})
+    attrs = vehicle.get("attrs", {}) or {}
+    ts = vehicle.get("last_seen_s", 0.0)
+    for key, value in attrs.items():
+        if key.endswith("_conf") or value in ("", None):
             continue
-        seen += 1
-        timestamp = frame_no / fps
-        frame = raw.copy()
+        storage.put_attribute(oid, key, str(value), _attr_conf(attrs, key), ts)
+    stage.forget(tid)
 
-        result = detector.track(frame, cfg["tracker"])
-        frame = checker.draw(frame, dict(store.lane_counts))
-        frame = zone.draw(frame, store.a_to_b, store.b_to_a)
 
-        if result.boxes is not None and result.boxes.id is not None:
-            boxes = result.boxes.xyxy.cpu().numpy()
-            ids = result.boxes.id.cpu().numpy().astype(int)
-            clss = result.boxes.cls.cpu().numpy().astype(int)
-            confs = result.boxes.conf.cpu().numpy()
-            for box, tid, cls, conf in zip(boxes, ids, clss, confs):
-                x1, y1, x2, y2 = map(int, box)
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                name = VehicleDetector.class_name(cls)
-                prev_cx, prev_cy = store.observe(tid, cx, cy)
-                event = store.zone_crossing(tid, cy, zone.line_a_y, zone.line_b_y, zone.enabled)
-                store.touch(tid, name, timestamp)
-                lane_id, lane_flag = checker.check(cx, cy, prev_cx, prev_cy, name, tid)
-                store.set_lane(tid, lane_id, lane_flag)
-
-                crop = raw[max(0, y1):y2, max(0, x1):x2]
-                vehicle = store.vehicles[tid]
-                if crop.size > 0:
-                    run_attributes(cfg["attributes"].get("enabled", []), crop, vehicle)
-                    if (out_cfg.get("save_crops", True) and tid not in store.saved_crops
-                            and conf > float(out_cfg.get("crop_min_conf", 0.5))):
-                        cv2.imwrite(f"outputs/crops/vehicle_{tid}.jpg", crop)
-                        store.saved_crops.add(tid)
-
-                csv.put({"frame": frame_no, "time_s": round(timestamp, 2), "object_id": tid,
-                         "vehicle_class": name, "confidence": round(float(conf), 3),
-                         "x1": x1, "y1": y1, "x2": x2, "y2": y2, "event": event,
-                         "lane_id": lane_id, "lane_flag": lane_flag,
-                         "plate_number": vehicle["attrs"].get("plate_number", ""),
-                         "plate_conf": vehicle["attrs"].get("plate_conf", 0.0),
-                         "color": vehicle["attrs"].get("color", "")})
-                box_color = (0, 255, 0)
-                if "wrong_way" in lane_flag:
-                    box_color = (0, 0, 255)      # red = going opposite
-                elif "wrong_lane" in lane_flag:
-                    box_color = (0, 165, 255)    # orange = wrong lane type
-                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                tag = f"#{tid} {name} {conf:.2f}"
-                if lane_id:
-                    tag += f" {lane_id}:{lane_flag}"
-                if vehicle["attrs"].get("plate_number"):
-                    tag += f" {vehicle['attrs']['plate_number']}"
-                cv2.putText(frame, tag, (x1, max(0, y1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
-
-        if save_frames and frame_no % every == 0:
-            cv2.imwrite(f"{frame_dir}/raw/frame_{frame_no:06d}.jpg", raw)
-            cv2.imwrite(f"{frame_dir}/annotated/frame_{frame_no:06d}.jpg", frame)
-        out.write(frame)
-        pbar.update(1)
-    pbar.close()
-    cap.release()
-    out.release()
-    df = csv.close()
-
-    elapsed = time.time() - start
+def _write_summary(cfg, info, store, elapsed, read_n, analysed, summaries, writer):
+    path = cfg["video"]["summary"]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     cam = cfg.get("camera", {})
-    with open(cfg["video"]["summary"], "w") as f:
-        f.write("TRAFFIC PROTOTYPE REPORT\n======================\n")
-        f.write(f"Source video : {src}\n")
-        f.write(f"Camera       : {cam.get('name', 'demo')} "
+    tracks = len(store.object_ids) + store.evicted
+    with open(path, "w") as f:
+        f.write("TRAFFIC REPORT\n==============\n")
+        f.write(f"Source        : {info.label}\n")
+        f.write(f"Camera        : {cam.get('name', 'demo')} "
                 f"({cam.get('label_a', 'entry')} -> {cam.get('label_b', 'exit')})\n")
-        f.write(f"Frames       : {frame_no} in {elapsed:.1f}s ({frame_no/elapsed:.1f} fps)\n")
-        f.write(f"Unique vehicles (object IDs): {len(store.vehicles)}\n")
-        f.write(f"A->B ({cam.get('label_a', 'entry')} to {cam.get('label_b', 'exit')}): {store.a_to_b}\n")
-        f.write(f"B->A ({cam.get('label_b', 'exit')} to {cam.get('label_a', 'entry')}): {store.b_to_a}\n")
-        f.write(f"Legacy IN: {store.in_count}, OUT: {store.out_count}\n")
-        f.write(f"\nPer-lane unique vehicles:\n")
-        for L in checker.lanes:
-            f.write(f"  {L['name']} ({L['direction']}): {store.lane_counts.get(L['name'], 0)}\n")
-        f.write(f"\nWrong-WAY IDs (opposite direction): {sorted(store.wrong_way_ids) or 'none'}\n")
-        f.write(f"Wrong-LANE IDs (wrong vehicle type): {sorted(store.wrong_lane_ids) or 'none'}\n")
-        f.write(f"\nPer-class count:\n")
-        for k, v in store.per_class_counts().items():
+        f.write(f"Frames        : read {read_n}, analysed {analysed} in "
+                f"{elapsed:.1f}s ({analysed/elapsed:.1f} fps)\n")
+        # Named precisely: ByteTrack mints a new id for a reappearing object,
+        # so this counts TRACKS, which is an upper bound on distinct objects.
+        f.write(f"Distinct track IDs: {tracks} "
+                f"(upper bound on real objects - a re-entering object gets a new ID)\n")
+        f.write(f"A->B          : {store.a_to_b}\nB->A          : {store.b_to_a}\n")
+        if writer is not None:
+            f.write(f"Frames stored : {writer.frames_written} files, "
+                    f"{writer.bytes_written/1e6:.1f} MB ({writer.format})\n")
+        f.write("\nPer-class track counts:\n")
+        for k, v in sorted(store.per_class_counts().items(), key=lambda kv: -kv[1]):
             f.write(f"  {k}: {v}\n")
-
-    print(f"[done] {elapsed:.1f}s | unique={len(store.vehicles)} "
-          f"A->B={store.a_to_b} B->A={store.b_to_a} (IN={store.in_count} OUT={store.out_count}) "
-          f"| lanes={dict(store.lane_counts)} "
-          f"| wrong_way={sorted(store.wrong_way_ids) or 'none'} "
-          f"| crops={len(store.saved_crops)}")
-    return {"frames": frame_no, "unique": len(store.vehicles), "df": df, "store": store}
+        f.write("\nAnalyzer summaries:\n")
+        for name, data in summaries.items():
+            f.write(f"  {name}: {data}\n")

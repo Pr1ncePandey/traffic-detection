@@ -6,6 +6,18 @@ vehicle['attrs'][name]. Search ("red Maruti") reads this dict later.
 
 from collections import defaultdict
 
+# ByteTrack keeps a lost track alive for track_buffer frames (30 by default)
+# and can still revive it. Evicting inside that window would throw away state
+# the tracker is about to reuse, so the TTL is a multiple of it.
+TTL_SAFETY = 3.0
+TTL_MIN_S = 5.0
+
+
+def ttl_for(fps: float, track_buffer: int = 30) -> float:
+    """Seconds of absence before a track may be retired."""
+    fps = float(fps) if fps and fps > 0 else 30.0
+    return max(TTL_MIN_S, (float(track_buffer) / fps) * TTL_SAFETY)
+
 
 class TrackStore:
     def __init__(self):
@@ -26,6 +38,11 @@ class TrackStore:
         self.lane_counts = defaultdict(int)  # lane name -> unique IDs seen
         self.wrong_way_ids = set()
         self.wrong_lane_ids = set()
+        self.object_ids = {}        # tid -> storage object id (survives in the DB)
+        self.evicted = 0           # tracks retired by evict_stale
+        # Cumulative, incremented once per track on first sight. self.vehicles
+        # cannot be used for totals because evict_stale removes from it.
+        self.class_totals = defaultdict(int)
 
     def crossing(self, tid: int, cy: int, line_y: int, line_enabled: bool) -> str:
         prev = self.prev_y.get(tid)
@@ -88,19 +105,78 @@ class TrackStore:
         if "wrong_lane" in flag:
             self.wrong_lane_ids.add(tid)
 
-    def touch(self, tid: int, vclass: str, timestamp: float):
+    def touch(self, tid: int, vclass: str, timestamp: float,
+              group: str = "", conf: float = 0.0):
         v = self.vehicles.get(tid)
         if v is None:
-            self.vehicles[tid] = {"vehicle_class": vclass, "first_seen_s": round(timestamp, 2),
-                                   "last_seen_s": round(timestamp, 2), "frames_seen": 1,
-                                   "attrs": {"plate_number": "", "plate_conf": 0.0,
-                                             "color": "", "brand": ""}}
+            self.class_totals[vclass] += 1
+            self.vehicles[tid] = {"vehicle_class": vclass, "cls_group": group,
+                                  "first_seen_s": round(timestamp, 2),
+                                  "last_seen_s": round(timestamp, 2), "frames_seen": 1,
+                                  "best_conf": round(float(conf), 3),
+                                  "attrs": {"plate_number": "", "plate_conf": 0.0,
+                                            "color": "", "brand": ""}}
         else:
             v["last_seen_s"] = round(timestamp, 2)
             v["frames_seen"] += 1
+            if conf > v.get("best_conf", 0.0):
+                v["best_conf"] = round(float(conf), 3)
+            if group and not v.get("cls_group"):
+                v["cls_group"] = group
+
+    def evict_stale(self, now_s: float, ttl_s: float, on_evict=None) -> int:
+        """Drop tracks unseen for ttl_s, after handing them to on_evict.
+
+        Why this exists: every container below is keyed by track id and the
+        original code never removed anything, so a 24/7 feed grew until the
+        process died. ByteTrack mints a NEW id for a reappearing object rather
+        than reusing the old one, so ids only ever accumulate.
+
+        ttl_s MUST exceed ByteTrack's own track_buffer (30 frames by default)
+        converted to seconds, or we would evict a track the tracker can still
+        revive - the caller computes that, see ttl_for().
+
+        on_evict(tid, vehicle) is called BEFORE the state is dropped, so the
+        final object row and voted plate can be persisted. Anything it raises
+        is swallowed: a storage hiccup must not abort the sweep and leak.
+        """
+        stale = [tid for tid, v in self.vehicles.items()
+                 if (now_s - v.get("last_seen_s", 0.0)) > ttl_s]
+        for tid in stale:
+            vehicle = self.vehicles.get(tid)
+            if on_evict is not None and vehicle is not None:
+                try:
+                    on_evict(tid, vehicle)
+                except Exception as e:
+                    print(f"[store] evict handler failed for track {tid}: {e}")
+            self.vehicles.pop(tid, None)
+            self.prev_y.pop(tid, None)
+            self.prev_xy.pop(tid, None)
+            self.lane_of.pop(tid, None)
+            self.lane_flag_of.pop(tid, None)
+            self.object_ids.pop(tid, None)
+            self.saved_crops.discard(tid)
+            self._seen_below.discard(tid)
+            self._seen_above.discard(tid)
+            self._counted.discard((tid, "A_TO_B"))
+            self._counted.discard((tid, "B_TO_A"))
+            self.wrong_way_ids.discard(tid)
+            self.wrong_lane_ids.discard(tid)
+        if stale:
+            # _lane_seen is keyed (lane, tid), so it needs a scan not a pop.
+            dead = set(stale)
+            self._lane_seen = {(ln, t) for (ln, t) in self._lane_seen if t not in dead}
+        self.evicted += len(stale)
+        return len(stale)
+
+    def state_size(self) -> int:
+        """Total tracked entries - used to assert memory really is bounded."""
+        return (len(self.vehicles) + len(self.prev_y) + len(self.prev_xy)
+                + len(self.lane_of) + len(self.lane_flag_of) + len(self.object_ids)
+                + len(self.saved_crops) + len(self._seen_below) + len(self._seen_above)
+                + len(self._counted) + len(self._lane_seen)
+                + len(self.wrong_way_ids) + len(self.wrong_lane_ids))
 
     def per_class_counts(self) -> dict:
-        counts = defaultdict(int)
-        for v in self.vehicles.values():
-            counts[v["vehicle_class"]] += 1
-        return dict(counts)
+        """Tracks per class over the WHOLE run, including evicted ones."""
+        return dict(self.class_totals)

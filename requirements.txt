@@ -1,7 +1,21 @@
+# --- Core: detection, tracking, counting. Always needed. ------------------
 ultralytics
 opencv-python
 pandas
 tqdm
 numpy
 pyyaml
-rapidocr-onnxruntime  # number-plate OCR (CPU). Plate box: models/lp_detector.pt
+
+# --- Number-plate OCR backends -------------------------------------------
+# Pick one with `plate.ocr_backend` in config.yaml. Vehicle counting works
+# with none of these installed; plate reading just stays empty.
+#
+# "rapidocr" (default, installed below): generic scene-text OCR, small, CPU.
+rapidocr-onnxruntime<2   # <2 matters: 2.x renamed the package and changed its return type
+#
+# "fast_plate": plate-specialised, small and fast. Installed below (~5MB model).
+fast-plate-ocr[onnx]
+#
+# "paddle_anpr": PP-OCRv5 finetuned on Indian plates, best on two-row plates.
+#     Heaviest install (paddle wheel + ~150MB weights + a PaddleOCR clone).
+#     pip install paddlepaddle safetensors

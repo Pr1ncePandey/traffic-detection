@@ -1,8 +1,25 @@
-# Demo camera: TWO roads side by side (ratio polygons, 0-1, any resolution).
-# Left road = coming (top->bottom, mostly empty). Right road = going (bottom->top, busy).
-# Copy this file per CCTV in production: cameras/<name>.yaml
-# Unknown clip? Run with lanes_mode: auto (halves guess) or
-#   python tools/calibrate.py --suggest-lanes --source other.mp4
+# Demo camera for samples/input.mp4 (1280x720): a dual carriageway split by a
+# white fence, seen from a footbridge. The NEAR road (right of the fence) runs
+# away from the camera; the FAR road (left of it) comes towards the camera.
+#
+# This file is the worked example of the `explicit` path: the geometry is
+# asserted here, and CHECKED against real motion during the warmup window.
+# Measured on the first 200 frames of input.mp4, that check reports:
+#
+#   right_going : configured up (+0deg), observed up (-4deg) over 11 tracks
+#                 -> agrees (alignment +1.00)
+#   left_coming : no traffic observed (0 tracks) - direction unverified
+#
+# The second line is the honest state of affairs, not a failure: the far
+# carriageway is empty for the whole clip, so its direction cannot be
+# confirmed from this footage. It is written down from the painted road arrows.
+#
+# Copy this file per CCTV as cameras/<name>.yaml, then:
+#   python main.py --camera <name>
+# To measure a new camera instead of asserting it:
+#   python tools/calibrate.py --suggest-lanes --source <video> --out cameras/<name>.yaml
+#   python tools/draw_lanes.py --source <video> --out cameras/<name>.yaml
+
 camera:
   name: "demo"
   line_a_ratio: 0.35      # upper line (exit side, top)
@@ -14,12 +31,23 @@ camera:
 
 lanes_mode: "explicit"
 
-lanes:  # fence/divider runs (0.34,0) -> (0.05,1). Left = coming, right = going.
-  - name: "left_coming"
-    polygon: [[0, 0], [0.34, 0], [0.05, 1], [0, 1]]
-    direction: "down"
-    allowed: []
-  - name: "right_going"
-    polygon: [[0.34, 0], [1.0, 0], [1.0, 1], [0.05, 1]]
-    direction: "up"
+# The fence, read off the frame: it crosses the top edge at x=0.356 and the
+# bottom edge at x=0.072. Given as a LINE, so "which side of the road is this
+# vehicle on" is a signed distance rather than a polygon-containment guess,
+# and so it can be drawn across the whole frame and checked by eye.
+divider:
+  points: [[0.356, 0.0], [0.072, 1.0]]
+
+lanes:
+  # `flow` is a unit vector in image coordinates (y grows DOWNWARD, so up the
+  # frame is negative). Preferred over `direction: up` because the road is not
+  # vertical in the image: measured flow on the near carriageway is 4 degrees
+  # west of straight up, and a cardinal name cannot express that.
+  - name: "right_going"     # near carriageway, right of the fence. Busy.
+    polygon: [[0.356, 0.0], [1.0, 0.0], [1.0, 1.0], [0.072, 1.0]]
+    flow: [-0.076, -0.997]  # away from the camera, measured over 11 tracks
+    allowed: []             # empty = every vehicle type allowed
+  - name: "left_coming"     # far carriageway, left of the fence. Empty here.
+    polygon: [[0.0, 0.0], [0.356, 0.0], [0.072, 1.0], [0.0, 1.0]]
+    flow: [0.076, 0.997]    # towards the camera; UNVERIFIED on this clip
     allowed: []

@@ -57,12 +57,3 @@ class LineCounter:
         cv2.putText(frame, f"IN:{in_count} OUT:{out_count}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, self.color, 2)
         return frame
-
-
-def check_lanes(lanes_cfg: list, cx: int, cy: int, prev_cx: int, prev_cy: int,
-                vclass: str = "") -> str:
-    """Legacy single-call compat. Returns "ok" (no flag).
-    Real lane logic lives in LaneChecker (src/analysis/lanes.py), which needs
-    frame size for ratio polygons — pipeline.py uses it directly.
-    """
-    return "ok"
