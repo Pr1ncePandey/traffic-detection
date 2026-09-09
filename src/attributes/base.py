@@ -5,7 +5,7 @@ Live now: 'type' (free from YOLO). Stubs with exact signatures: 'color',
 to attributes.enabled in config.yaml. No refactor needed.
 """
 from .color import extract_color  # noqa: F401  (kept contract -> str)
-from .color import extract_color_conf
+from .color import extract_color_conf, garment_colors
 from .plate import configure as configure_plate  # noqa: F401
 from .plate import crop_score, read_plate, read_plate_tracked  # noqa: F401
 
@@ -21,6 +21,16 @@ def run_attributes(enabled: list, crop, vehicle: dict) -> dict:
             if cname and float(cconf) >= float(attrs.get("color_conf", 0.0)):
                 attrs["color"] = cname
                 attrs["color_conf"] = round(float(cconf), 3)
+        except Exception:
+            pass
+    if "clothes" in enabled:
+        try:
+            g = garment_colors(crop)
+            for key in ("upper_color", "lower_color"):
+                conf_key = key + "_conf"
+                if g[key] and float(g[conf_key]) >= float(attrs.get(conf_key, 0.0)):
+                    attrs[key] = g[key]
+                    attrs[conf_key] = round(float(g[conf_key]), 3)
         except Exception:
             pass
     if "plate" in enabled:
@@ -39,5 +49,9 @@ def run_attributes(enabled: list, crop, vehicle: dict) -> dict:
     attrs.setdefault("plate_conf", 0.0)
     attrs.setdefault("color", attrs.get("color", ""))
     attrs.setdefault("color_conf", attrs.get("color_conf", 0.0))
+    attrs.setdefault("upper_color", attrs.get("upper_color", ""))
+    attrs.setdefault("upper_color_conf", attrs.get("upper_color_conf", 0.0))
+    attrs.setdefault("lower_color", attrs.get("lower_color", ""))
+    attrs.setdefault("lower_color_conf", attrs.get("lower_color_conf", 0.0))
     attrs.setdefault("brand", attrs.get("brand", ""))
     return attrs

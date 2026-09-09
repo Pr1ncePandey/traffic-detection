@@ -205,7 +205,7 @@ source:                  # only used for live sources (rtsp:// / http:// / webca
                          #   buffer_all  = lose nothing, latency may grow
   queue_size: null
 
-analyzers: ["counting", "lanes", "anpr"]   # add "congestion" to enable it - no code change
+analyzers: ["counting", "lanes", "anpr", "color"]   # add "congestion" to enable it - no code change
 
 storage:
   backend: "sqlite"

@@ -54,7 +54,7 @@ DEFAULTS = {
     # themselves concurrent onto worker threads. See analysis/stage.py.
     "analysis": {"parallel": False, "workers": None},
     # Use cases, in run order. Add "congestion" to enable it - no code change.
-    "analyzers": ["counting", "lanes", "anpr"],
+    "analyzers": ["counting", "lanes", "anpr", "color"],
     "storage": {"backend": "sqlite", "path": "outputs/traffic.db",
                 "batch_rows": 500, "commit_interval": 2.0, "csv_export": True},
     # Every analysed frame is stored raw AND annotated.

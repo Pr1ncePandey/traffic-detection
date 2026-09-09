@@ -47,7 +47,15 @@ class CongestionAnalyzer:
         self._fps = 30.0
 
     def setup(self, source, cfg: dict):
-        self._fps = float(getattr(source, "fps", 30.0) or 30.0)
+        src_fps = float(getattr(source, "fps", 30.0) or 30.0)
+        # seconds_at must tick on ANALYSED frames, not source frames: at
+        # analyse_fps=5 on a 30fps source each analysed frame is 6 source
+        # frames, so dividing by source fps would inflate seconds ~6x.
+        try:
+            target = (cfg or {}).get("processing", {}).get("analyse_fps")
+            self._fps = min(src_fps, float(target)) if target else src_fps
+        except (TypeError, ValueError):
+            self._fps = src_fps
         self._area = max(1, int(getattr(source, "width", 1)) *
                          int(getattr(source, "height", 1)))
 

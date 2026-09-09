@@ -8,7 +8,8 @@ body band (middle of the crop; roof glass and road edges excluded).
 White/black/grey decided by saturation+brightness, the rest by hue.
 Conf = share of counted pixels wearing the winning color.
 Daylight tuned; night/streetlight shifts hue (documented limit).
-Person clothes reuse: dominant_hsv(region) on upper/lower halves.
+Person clothes reuse: garment_colors() runs dominant_hsv() on torso + leg
+bands. Same honesty rules (40% share, else "").
 """
 
 import cv2
@@ -24,9 +25,10 @@ HUE_NAMES = [
 MIN_COUNT = 400  # fewer body pixels than this = unknown (too small/far)
 MIN_FRAC = 0.40   # winner needs 40%+ of band pixels, else ambiguous (glass vs
                   # paint, e.g. black SUV rear where windshield dominates) -> ""
+GARMENT_MIN_FRAC = 0.30  # people are small/blurry: lower bar, conf still reported
 
 
-def dominant_hsv(region_bgr):
+def dominant_hsv(region_bgr, min_count=MIN_COUNT):
     """Most common HSV bin in region. Returns (kind, name, frac)."""
     hsv = cv2.cvtColor(region_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
@@ -52,7 +54,7 @@ def dominant_hsv(region_bgr):
     cands.update(votes)
     name = max(cands, key=lambda k: cands[k])
     n = int(cands[name])
-    if n < MIN_COUNT:
+    if n < min_count:
         return ("none", "", 0.0)
     kind = "achromatic" if name in ("white", "black", "grey") else "hue"
     return (kind, name, n / total)
@@ -80,3 +82,31 @@ def extract_color_conf(crop_bgr):
 
 def extract_color(crop_bgr) -> str:
     return extract_color_conf(crop_bgr)[0]
+
+
+def garment_colors(crop_bgr) -> dict:
+    """Shirt + trousers color for a person crop. Returns
+    {upper_color, upper_color_conf, lower_color, lower_color_conf}
+    ("" / 0.0 unknown). Conf keys follow the {key}_conf convention so
+    pipeline._attr_conf resolves them with no special-casing.
+    Torso band avoids head (skin/hair) and feet (road). Small/far people
+    honestly return unknown."""
+    out = {"upper_color": "", "upper_color_conf": 0.0,
+           "lower_color": "", "lower_color_conf": 0.0}
+    try:
+        h, w = crop_bgr.shape[:2]
+        if w < 20 or h < 60:
+            return out
+        torso = crop_bgr[int(h * 0.20):int(h * 0.55), int(w * 0.15):int(w * 0.85)]
+        legs = crop_bgr[int(h * 0.55):int(h * 0.95), int(w * 0.15):int(w * 0.85)]
+        for band, prefix in ((torso, "upper"), (legs, "lower")):
+            if band.size == 0:
+                continue
+            # People are small/far: 150px floor (frac gate still guards noise).
+            _, name, frac = dominant_hsv(band, min_count=150)
+            if name and frac >= GARMENT_MIN_FRAC:
+                out[prefix + "_color"] = name
+                out[prefix + "_color_conf"] = round(float(frac), 3)
+        return out
+    except Exception:
+        return out
