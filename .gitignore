@@ -17,6 +17,10 @@ yolov8n.pt
 *.onnx
 *.pth
 
+# Third-party PaddleOCR source checkout (runtime dep for paddle_anpr backend;
+# clone with: git clone --depth 1 https://github.com/PaddlePaddle/PaddleOCR.git models/PaddleOCR)
+models/PaddleOCR/
+
 # OS junk
 .DS_Store
 Thumbs.db

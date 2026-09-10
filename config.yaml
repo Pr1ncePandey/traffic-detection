@@ -47,7 +47,7 @@ camera:                  # ONE file per CCTV in production (cameras/<name>.yaml)
 
 # WRONG-SIDE DETECTION ------------------------------------------------------
 # This block USED to carry two polygons hand-tuned on samples/input.mp4, and
-# every other source silently inherited them. Run on samples/plate_test.mp4
+# every other source silently inherited them. Run on Indian test footage
 # that divider cut through the middle of a single one-way carriageway: 2 of 90
 # vehicle tracks were reported wrong-way, both driving correctly. So the
 # default is now to MEASURE the geometry instead of asserting it.
@@ -83,7 +83,7 @@ lanes_rules:
   warmup_frames: 300      # frames spent MEASURING before any alert can fire.
                           # Also what gives each track enough history for a
                           # heading, so nothing can be flagged on frame 1.
-                          # Measured: 120 frames of samples/plate_test.mp4
+                          # Measured: 120 frames of Indian test footage
                           # attributed only 4 tracks to the misconfigured
                           # lane, which was too thin to call the mismatch;
                           # 200 frames gave 8 tracks and called it clearly.
@@ -114,7 +114,7 @@ lanes_rules:
                           # its bottom-centre is not where the vehicle is.
   max_gap_frames: 5       # a track the detector LOST and re-acquired is not
                           # one observation. Measured on a full run of
-                          # samples/plate_test.mp4: track 349 vanished for 26
+                          # Indian test footage: track 349 vanished for 26
                           # frames and came back 218 px lower, which the
                           # velocity window read as downward travel - the
                           # run's only wrong-way alert, on a vehicle driving
@@ -218,7 +218,7 @@ frames:                  # EVERY analysed frame is stored raw AND annotated
   enabled: true
   format: "jpeg"         # jpeg = one file per frame per variant (simple; right for a clip)
                          # segments = rolling H.264, same every-frame guarantee
-                         # MEASURED on samples/plate_test.mp4 (1080p): 378 KB/frame
+                          # MEASURED on Indian test footage (1080p): 378 KB/frame
                          # at q85 => ~2 TB/day raw+annotated at 30fps, vs ~130 GB/day
                          # as segments. Switch before using a permanent stream.
   dir: "outputs/frames"

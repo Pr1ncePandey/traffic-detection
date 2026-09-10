@@ -133,8 +133,8 @@ plus **one image per detected object** (the sharpest crop seen, not the first).
 | `jpeg` (default) | **~2 TB/day** | finite clips; ~614 MB for the 812-frame sample |
 | `segments` | **~130 GB/day** | permanent streams; rolling H.264, seek by (segment, offset) |
 
-Those figures are **measured**, not estimated: 1080p traffic footage from
-`samples/plate_test.mp4` encodes to 378 KB/frame at q85. Switch to `segments`
+Those figures are **measured**, not estimated: 1080p Indian traffic footage
+encodes to 378 KB/frame at q85. Switch to `segments`
 before pointing this at a 24/7 camera. Retention (`max_age_hours`,
 `max_disk_gb`) deletes oldest-first and keeps rows and files consistent.
 
@@ -213,7 +213,7 @@ analysis:
 `parallel` is off by default, and honestly: the wrong-side rule is a few dozen
 float operations per object (measured 0.19 ms/frame) — GIL-bound, and dispatch
 costs more than it saves. It is worth turning on once a *heavy* analysis is
-staged. Measured on a 400-frame run of `samples/plate_test.mp4`: with
+staged. Measured on a 400-frame run of Indian test footage: with
 `counting,lanes` 24 fps; adding `anpr` drops it to 5.4 fps. ANPR is the
 analysis with something to gain, because plate detection and OCR release the
 GIL. Lanes is structured this way so it can sit next to that without being
@@ -236,7 +236,7 @@ lanes_mode: "auto"        # measure the geometry from motion (default)
 
 **The geometry is measured or checked, never just asserted.** It used to be a
 pair of polygons hand-tuned on `samples/input.mp4` and inherited unchecked by
-every other source. On `samples/plate_test.mp4` that divider cut diagonally
+every other source. On Indian test footage that divider cut diagonally
 through the middle of a single one-way carriageway: 2 of 90 vehicle tracks were
 reported wrong-way, **both driving correctly, 0 real offenders**. So during a
 warmup window (`lanes_rules.warmup_frames`, default 300) no alert can fire and
@@ -302,8 +302,9 @@ Indian-format correction and a plate-ish gate. Swap the reader with
 | `rapidocr` | in `requirements.txt` | 0.88 | 370 | Generic scene-text OCR, **not** plate-specialised. Fallback only. |
 
 CER = character error rate, lower is better, measured on `samples/plate_gt.csv`
-(5 hand-labelled plates from `samples/plate_test.mp4`). Only this column is
-comparable — the vendors' published figures come from different datasets. n=5 is
+(5 hand-labelled plates; the crops in `samples/plates/` were cut from the
+earlier Indian clip, since replaced by `samples/indian_road.mp4`). Only this
+column is comparable — the vendors' published figures come from different datasets. n=5 is
 thin: treat the ordering as solid and the values as indicative.
 
 `paddle_anpr` needs weights and a PaddleOCR checkout:
@@ -358,6 +359,23 @@ python main.py
 python report.py
 python query.py --list
 ```
+
+Windows (PowerShell), same idea — keep the venv **outside** the project folder
+so it never gets zipped or pushed (venvs are machine-specific and gigabytes):
+
+```powershell
+py -3.12 -m venv C:\Users\Prince\venvs\traffic
+C:\Users\Prince\venvs\traffic\Scripts\python.exe -m pip install -r requirements.txt
+C:\Users\Prince\venvs\traffic\Scripts\python.exe main.py --max-frames 60
+```
+
+Python version rule: anything 3.10+ runs detection, tracking, lanes, color
+and congestion. The `paddle_anpr` plate backend needs **3.11 or 3.12**
+(`paddlepaddle` publishes no wheels for newer versions) — on 3.13+ plates
+just stay empty with a warning, nothing crashes. Paddle setup (opt-in):
+`pip install paddlepaddle safetensors scikit-image`, clone PaddleOCR to
+`models/PaddleOCR`, weights auto-download from HuggingFace — full commands in
+the ANPR section above.
 
 All settings live in `config.yaml`; CLI flags override them.
 
@@ -427,8 +445,8 @@ Known limits, stated plainly:
   its configured direction stays unverified — an absence of alerts from it
   means nothing either way.
 - In `auto` mode the lane is the convex hull of where warmup traffic actually
-  drove, so an object in a part of the road nothing used during warmup reads
-  as off-lane and gets no verdict. On the full `plate_test.mp4` run that is
+drove, so an object in a part of the road nothing used during warmup reads
+as off-lane and gets no verdict. On the full Indian-clip run that is
   about half of all detection rows — most of them pedestrians and the far
   carriageway, but not all. Draw the lane by hand if you need full coverage.
 - `jpeg` frame storage is ~2 TB/day at 1080p30 — use `segments` for permanent streams.
