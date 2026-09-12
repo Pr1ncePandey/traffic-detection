@@ -43,6 +43,14 @@ LOCKED_KEYS = (
     "perception.model.name",      # one model, or counts are incomparable
     "perception.model.device",
     "analysis",                   # scheduling/threading is a host property
+    "server",                     # one listen address for the whole service;
+                                  # a camera file must not be able to move it
+    "retention",                  # one disk budget over one shared database
+    "incidents.subscriptions",    # who gets told is an operator decision, not
+                                  # a per-camera one. Per-camera FILTERING is
+                                  # still available via a subscription's
+                                  # `cameras` list, which is the right place
+                                  # for it: routing stays in one file.
 )
 
 # Overridable, but say so out loud.
@@ -62,16 +70,29 @@ _PATH_KEYS = ("video.target", "video.csv", "video.summary",
 DEFAULTS = {
     # Identity. `id` is the cameras/<id>.yaml stem and the {camera_id} used in
     # output paths; `name` is what a human reads in the report.
-    "camera": {"id": "demo", "name": "demo"},
+    # `location` is where this camera physically is. Declared here in DEFAULTS
+    # rather than only in the yaml because that is what makes it a KNOWN key:
+    # without an entry, _warn_unknown() prints "no such setting; ignoring" and
+    # the value is silently dropped. null/null means "location unknown", which
+    # journeys report as an unmeasurable hop rather than a distance of zero.
+    "camera": {"id": "demo", "name": "demo",
+               "location": {"lat": None, "lon": None}},
 
     # A camera declares its OWN source, so geometry and footage cannot be
     # mismatched - pairing one camera's lanes with another's video produces
     # plausible-looking but wrong lane flags, which is worse than an error.
+    #
+    # recorded_at: when the FOOTAGE starts, as a unix epoch or an ISO-8601
+    # string. Only meaningful for file sources, where frame timestamps are
+    # seconds-from-clip-start and therefore not comparable across cameras until
+    # anchored to something real. See src/timebase.py for why this cannot be
+    # inferred. Live sources ignore it - they are already on wall-clock.
     "video": {"source": "samples/input.mp4",
               "target": "outputs/{camera_id}/annotated.mp4",
               "csv": "outputs/{camera_id}/tracks.csv",
               "summary": "outputs/{camera_id}/summary.txt",
-              "write_video": True},
+              "write_video": True,
+              "recorded_at": None},
 
     # Only used for live sources (rtsp:// / http:// / webcam index).
     "source": {"reconnect": True, "max_retries": 0, "backpressure": None,
@@ -166,6 +187,73 @@ DEFAULTS = {
     # this keys on the plate so it gets its original id back.
     "reid": {"enabled": True, "min_conf": 0.7, "require_format": True,
              "fuzzy_distance": 0, "cache_size": 4096},
+
+    # Multi-camera journey reconstruction (offline; see src/journeys.py).
+    #   max_gap_s     idle time that ends one trip and starts another. A car at
+    #                 camera A in the morning and at A again at night made two
+    #                 trips; it did not loop.
+    #   max_speed_kmh implied-speed ceiling per hop, from haversine distance
+    #                 over elapsed time. Above this the two sightings are an OCR
+    #                 collision or a cloned plate, not a journey. Hops are
+    #                 FLAGGED, never dropped - a bad plate merge should be
+    #                 visible rather than invisible.
+    "journey": {"max_gap_s": 1800, "max_speed_kmh": 150},
+
+    # THE SERVICE (serve.py). Host property, so it is locked fleet-wide: a
+    # camera file cannot move the listen address out from under the operator.
+    #   host      127.0.0.1 and nothing else by default. There is NO
+    #             application-level auth, and /crops serves plate imagery while
+    #             /live streams plate strings, so binding wider publishes both.
+    #   push_hz   WebSocket rate, independent of analyse_fps. Nobody reads 30
+    #             updates a second and a file replaying at 3x would flood it.
+    "server": {"host": "127.0.0.1", "port": 8000, "push_hz": 8.0},
+
+    # INCIDENT WEBHOOKS. Policy, not code: which kinds fire is config.
+    "incidents": {
+        "enabled": True,
+        # A per-vehicle incident fires at track retirement, where the voted
+        # plate and chosen crop exist. A track that never retires (a parked
+        # car - exactly the stationary-obstruction case worth alerting on)
+        # force-fires after this many seconds of continuous flagging, then is
+        # suppressed permanently so "fire once" stays true.
+        "max_dwell_s": 120,
+        # Congestion fires on clear->congested and back, but only once the new
+        # state has HELD this long. Without the dwell, a metric oscillating
+        # around its threshold emits hundreds of webhooks a minute.
+        "congestion_dwell_s": 30,
+        "congested_at": "heavy",     # free | busy | heavy | jammed
+        # Prefix for image_url in the payload. A crop's local path under
+        # outputs/ is unreadable to a remote consumer, so the payload points at
+        # this server's /crops endpoint instead. Empty = send null.
+        "base_url": "",
+        # crossing is deliberately false and would be wrong to enable: it fires
+        # for EVERY vehicle, so it is a counter rather than an incident.
+        "kinds": {"wrong_way": True, "congestion": True,
+                  "wrong_lane": False, "crossing": False},
+        # One incident fans out to every matching subscription, each with its
+        # own deliveries row - so retries and dead-lettering are per subscriber
+        # and one broken consumer cannot delay another. Absent or empty filters
+        # mean "everything". The secret is read from the ENVIRONMENT, never
+        # from this file.
+        "subscriptions": [],
+    },
+
+    # RETENTION beyond frames. 0 = unlimited everywhere, matching
+    # frames.retention exactly so there is one retention idiom, not two.
+    # Nothing is deleted that an operator did not ask to have deleted.
+    "retention": {
+        "check_interval": 60,
+        # Crops were never reaped at all before this: one JPEG per object
+        # accumulated forever. A crop an incident references is PINNED and
+        # survives until that incident is reaped, so a delivered image_url
+        # stays valid exactly as long as its incident.
+        "crops": {"max_age_hours": 0, "max_disk_gb": 0},
+        # events is the high-volume table - `crossing` fires per vehicle per
+        # line - so it is the one most likely to need a real cap in practice.
+        "events": {"max_age_hours": 0},
+        "deliveries": {"max_age_hours": 0},
+        "incidents": {"max_age_hours": 0},
+    },
 }
 
 

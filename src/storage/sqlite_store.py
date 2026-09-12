@@ -28,11 +28,26 @@ from collections import OrderedDict
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
+-- One writer thread means contention is largely designed out, but the frame
+-- reaper, external readers, backups and anyone opening the file with a CLI can
+-- still collide. One pragma removes a whole class of intermittent
+-- "database is locked" failures.
+PRAGMA busy_timeout=5000;
 
+-- time_base says which CLOCK first_seen_s/last_seen_s/ts are on, because the
+-- pipeline writes two incompatible kinds of number into one column: a
+-- wall-clock epoch (~1.7e9) for live sources, seconds-from-start-of-clip
+-- (~12.4) for files. Without this, one fleet-wide DB holding both makes any
+-- ORDER BY time return silent nonsense. recorded_at is the footage's real
+-- start time, which is what makes a file run's clip-seconds absolute.
+-- cam_lat/cam_lon are SNAPSHOT here rather than read from yaml at query time:
+-- editing a camera file months later must not retroactively move where a
+-- historical sighting happened.
 CREATE TABLE IF NOT EXISTS runs(
   id INTEGER PRIMARY KEY, started_at REAL, ended_at REAL,
   source TEXT, camera TEXT, fps REAL, width INT, height INT,
-  analyse_fps REAL, config_json TEXT);
+  analyse_fps REAL, config_json TEXT,
+  time_base TEXT, recorded_at REAL, cam_lat REAL, cam_lon REAL);
 
 CREATE TABLE IF NOT EXISTS frames(
   id INTEGER PRIMARY KEY, run_id INT, frame_no INT, ts REAL,
@@ -79,6 +94,36 @@ CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INT, frame_id INT, object_id INT,
   kind TEXT, detail_json TEXT, ts REAL);
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+
+-- THE OUTBOX. An incident is the durable record of something worth telling
+-- someone about; a delivery is one attempt to tell one subscriber.
+--
+-- id is a TEXT natural key ("demo-1841-wrong_way"), not an autoincrement, and
+-- that is the idempotency contract: delivery is at-least-once, so a consumer
+-- that has already seen this id must be able to recognise it. INSERT OR IGNORE
+-- on the primary key also makes a double fire locally harmless.
+CREATE TABLE IF NOT EXISTS incidents(
+  id TEXT PRIMARY KEY, camera TEXT, kind TEXT, object_id INT, vehicle_id INT,
+  payload_json TEXT, created_at REAL);
+CREATE INDEX IF NOT EXISTS idx_incidents_created ON incidents(created_at);
+CREATE INDEX IF NOT EXISTS idx_incidents_kind ON incidents(kind);
+CREATE INDEX IF NOT EXISTS idx_incidents_crop ON incidents(object_id);
+
+-- One row per (incident, subscriber). endpoint lives HERE rather than only in
+-- config because retries and dead-lettering are per subscriber: one broken
+-- consumer must not delay another, which a single shared attempt counter
+-- could not express.
+--   status: pending | sent | dead
+-- next_attempt_at is the backoff clock; the dispatcher polls on it.
+CREATE TABLE IF NOT EXISTS deliveries(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id TEXT, endpoint TEXT,
+  attempts INT DEFAULT 0, next_attempt_at REAL,
+  status TEXT DEFAULT 'pending', last_error TEXT,
+  created_at REAL, sent_at REAL,
+  UNIQUE(incident_id, endpoint));
+CREATE INDEX IF NOT EXISTS idx_deliveries_due
+  ON deliveries(status, next_attempt_at);
 """
 
 # INSERT templates per table. Keys are the queue's routing labels.
@@ -141,6 +186,36 @@ _COLS = {
     "events": ("run_id", "frame_id", "object_id", "kind", "detail_json", "ts"),
 }
 
+# (table, column, what it was added for) - checked before the schema script.
+# Add an entry whenever a column joins a table that already ships in the wild.
+_REQUIRED_COLS = (
+    ("objects", "vehicle_id", "vehicle re-identification"),
+    ("runs", "time_base", "comparable cross-camera timestamps"),
+)
+
+# Which tables may be DROPPED rather than blocked on when the write queue is
+# full. The split is by volume, not importance: frames and detections are
+# written once per frame and are reconstructible-ish, so shedding them lets the
+# queue drain. objects/vehicles/attributes/events are ~once per track or per
+# incident, so they are the durable record and always wait their turn - and
+# because the droppable tables are the ones filling the queue, that wait ends.
+_SHEDDABLE = frozenset({"frames", "detections"})
+
+
+def _opt_float(value):
+    """None stays None. Load-bearing: recorded_at NULL means 'unorderable',
+    which 0.0 would silently turn into 1970."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_str(value):
+    return None if value in (None, "") else str(value)
+
 
 class SqliteStore:
     BATCH_ROWS = 500          # flush once this many rows are pending...
@@ -150,8 +225,11 @@ class SqliteStore:
                               # block rather than grow memory without bound.
     MINTED_CAP = 1024         # plate->id entries held across the commit window
 
+    FAILURE_ALARM_AFTER = 3   # consecutive failed commits before escalating
+
     def __init__(self, path: str, batch_rows: int | None = None,
-                 commit_interval: float | None = None):
+                 commit_interval: float | None = None,
+                 shed_when_full: bool = False):
         self.path = path
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.batch_rows = int(batch_rows or self.BATCH_ROWS)
@@ -184,29 +262,44 @@ class SqliteStore:
         # this many mints old has certainly been committed (the writer flushes
         # every batch_rows rows or commit_interval seconds).
         self._minted: OrderedDict[str, int] = OrderedDict()
+        # Live sources shed instead of applying backpressure: a blocking put
+        # stalls inference, and on a camera that means dropping real-world time
+        # that can never be recovered. A file is merely slow, so it keeps the
+        # backpressure and loses nothing.
+        self.shed_when_full = bool(shed_when_full)
+        self.rows_written = 0
+        self.rows_dropped = 0          # shed at the queue, by table
+        self.dropped_by_table: dict[str, int] = {}
+        self.rows_failed = 0           # lost to a failing commit
+        self.write_failures = 0        # total failed commits
+        self._consecutive_failures = 0
+        self.last_write_error: str | None = None
+        self.write_alarm = False       # sticky: a persistent failure happened
         self._thread = threading.Thread(target=self._writer, name="sqlite-writer", daemon=True)
         self._thread.start()
-        self.rows_written = 0
 
     def _assert_schema_current(self):
-        """Fail loudly on a database written before objects.vehicle_id existed.
+        """Fail loudly on a database predating a column this code now writes.
 
         CREATE TABLE IF NOT EXISTS cannot add a column, so an older file keeps
-        its 12-column objects table while _SQL now supplies 13 values. That
-        raises inside _commit(), which catches per BATCH - so the run would
-        appear to work while silently discarding up to batch_rows object rows at
-        a time. A hard error naming the fix is worth more than a migration here.
+        its narrower table while _SQL supplies more values. For `objects` that
+        raises inside _commit(), which catches per table per batch - so the run
+        would appear to work while silently discarding up to batch_rows object
+        rows at a time. A hard error naming the fix is worth more than a
+        migration here.
 
         Called before the schema script for the reason given at the call site.
-        A brand-new file has no objects table yet, so the empty-cols case is a
-        pass, not a failure.
+        A brand-new file has none of these tables yet, so the empty-cols case is
+        a pass, not a failure.
         """
-        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(objects)")}
-        if cols and "vehicle_id" not in cols:
-            raise RuntimeError(
-                f"{self.path} predates vehicle re-identification (objects has no "
-                f"vehicle_id column). Delete it, or point --db at a new path; "
-                f"object rows would otherwise be dropped silently.")
+        for table, column, why in _REQUIRED_COLS:
+            cols = {r[1] for r in
+                    self._conn.execute(f"PRAGMA table_info({table})")}
+            if cols and column not in cols:
+                raise RuntimeError(
+                    f"{self.path} predates {why} ({table} has no {column} "
+                    f"column). Delete it, or point --db at a new path; rows "
+                    f"would otherwise be dropped silently.")
 
     def _max_id(self, table: str) -> int:
         cur = self._conn.execute(f"SELECT COALESCE(MAX(id),0) FROM {table}")
@@ -230,25 +323,63 @@ class SqliteStore:
 
     # --- run lifecycle ------------------------------------------------------
     def start_run(self, meta: dict) -> int:
+        """Open a run row.
+
+        `time_base` and `recorded_at` are what make this run's timestamps
+        comparable with another camera's - see the runs DDL and src/timebase.py.
+        `cam_lat`/`cam_lon` are snapshotted rather than referenced so a later
+        yaml edit cannot move a historical sighting.
+        """
         cur = self._conn.execute(
-            "INSERT INTO runs(started_at,source,camera,fps,width,height,analyse_fps,config_json)"
-            " VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO runs(started_at,source,camera,fps,width,height,"
+            "analyse_fps,config_json,time_base,recorded_at,cam_lat,cam_lon)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), str(meta.get("source", "")), str(meta.get("camera", "")),
              float(meta.get("fps", 0) or 0), int(meta.get("width", 0) or 0),
              int(meta.get("height", 0) or 0), float(meta.get("analyse_fps", 0) or 0),
-             json.dumps(meta.get("config", {}), default=str)))
+             json.dumps(meta.get("config", {}), default=str),
+             _opt_str(meta.get("time_base")), _opt_float(meta.get("recorded_at")),
+             _opt_float(meta.get("cam_lat")), _opt_float(meta.get("cam_lon"))))
         self._conn.commit()
         self.run_id = int(cur.lastrowid)
         return self.run_id
 
-    def end_run(self):
-        self._conn.execute("UPDATE runs SET ended_at=? WHERE id=?", (time.time(), self.run_id))
+    def end_run(self, run_id: int | None = None):
+        """Close a run row. Pass run_id when the store is SHARED.
+
+        `self.run_id` is only meaningful for a single-camera process. When N
+        camera workers share one store (the server's process model) it holds
+        whichever run started last, so a caller that owns a run must name it.
+        """
+        target = self.run_id if run_id is None else int(run_id)
+        if not target:
+            return
+        self._conn.execute("UPDATE runs SET ended_at=? WHERE id=?",
+                           (time.time(), target))
         self._conn.commit()
 
     # --- writes: queued ----------------------------------------------------
+    def _enqueue(self, table: str, values):
+        """Queue one row, shedding rather than blocking where that is allowed.
+
+        The old unconditional blocking put meant a writer falling behind stalled
+        the frame loop. On a file that is merely slow; on a live camera it drops
+        real-world time that cannot be recovered, so the loop must keep running
+        and the loss must be COUNTED - a silently degrading feed is worse than
+        an obviously broken one. See _SHEDDABLE for what may go.
+        """
+        if self.shed_when_full and table in _SHEDDABLE:
+            try:
+                self._q.put_nowait((table, values))
+            except queue.Full:
+                self.rows_dropped += 1
+                self.dropped_by_table[table] = self.dropped_by_table.get(table, 0) + 1
+            return
+        self._q.put((table, values))
+
     def _put(self, table: str, row: dict):
         cols = _COLS[table]
-        self._q.put((table, tuple(row.get(c) for c in cols)))
+        self._enqueue(table, tuple(row.get(c) for c in cols))
 
     def put_frame(self, row: dict):
         row.setdefault("run_id", self.run_id)
@@ -264,8 +395,8 @@ class SqliteStore:
 
     def put_attribute(self, object_id: int, key: str, value: str,
                       conf: float = 0.0, ts: float = 0.0):
-        self._q.put(("attributes", (int(object_id), str(key), str(value),
-                                    float(conf), float(ts))))
+        self._enqueue("attributes", (int(object_id), str(key), str(value),
+                                     float(conf), float(ts)))
 
     # --- durable identity (see trackers/identity.py) ------------------------
     def lookup_vehicle(self, plate: str):
@@ -340,6 +471,83 @@ class SqliteStore:
         if ids:
             self._q.put(("__delete_frames__", ids))
 
+    # --- the outbox (see src/incidents.py) ---------------------------------
+    def put_incident(self, incident: dict, endpoints) -> None:
+        """Queue one incident plus a delivery row per subscriber, ATOMICALLY.
+
+        Routed as a single queue item rather than as N ordinary row writes for
+        two reasons. First, the dispatcher reads `deliveries` and joins to
+        `incidents` for the payload, so a delivery committed before its
+        incident is a row pointing at nothing. Second, both tables must appear
+        together or not at all - a committed incident with no deliveries is an
+        alert that will never be sent and nothing says so.
+
+        An incident with no matching subscriber still gets its row: the record
+        is worth keeping (and the dashboard reads it) even when nobody asked to
+        be told.
+        """
+        self._q.put(("__incident__", (dict(incident), list(endpoints))))
+
+    def _write_incident(self, incident: dict, endpoints: list) -> None:
+        now = time.time()
+        try:
+            # OR IGNORE, not a bare INSERT: the id is a natural key, so a
+            # double fire for one track is a no-op rather than an exception
+            # that would take the batch down with it.
+            self._conn.execute(
+                "INSERT OR IGNORE INTO incidents"
+                "(id,camera,kind,object_id,vehicle_id,payload_json,created_at)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (str(incident["id"]), incident.get("camera"), incident.get("kind"),
+                 incident.get("object_id"), incident.get("vehicle_id"),
+                 json.dumps(incident.get("payload", {}), default=str),
+                 float(incident.get("created_at") or now)))
+            for endpoint in endpoints:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO deliveries"
+                    "(incident_id,endpoint,attempts,next_attempt_at,status,created_at)"
+                    " VALUES(?,?,0,?,'pending',?)",
+                    (str(incident["id"]), str(endpoint), now, now))
+            self._conn.commit()
+            self.rows_written += 1 + len(endpoints)
+        except Exception as e:
+            self.rows_failed += 1
+            self.write_failures += 1
+            self.last_write_error = f"incident: {e}"
+            print(f"[sqlite] incident write failed for "
+                  f"{incident.get('id')!r}: {e}")
+
+    def due_deliveries(self, limit: int = 50) -> list:
+        """Pending deliveries whose backoff has elapsed, oldest first."""
+        rows = self._rconn.execute(
+            "SELECT d.id, d.incident_id, d.endpoint, d.attempts,"
+            "       i.payload_json, i.kind, i.camera"
+            " FROM deliveries d JOIN incidents i ON i.id = d.incident_id"
+            " WHERE d.status='pending' AND d.next_attempt_at <= ?"
+            " ORDER BY d.next_attempt_at ASC LIMIT ?",
+            (time.time(), int(limit))).fetchall()
+        cols = ("id", "incident_id", "endpoint", "attempts", "payload_json",
+                "kind", "camera")
+        return [dict(zip(cols, r)) for r in rows]
+
+    def mark_delivery(self, delivery_id: int, status: str, attempts: int,
+                      next_attempt_at: float | None = None,
+                      error: str | None = None) -> None:
+        """Record the outcome of one delivery attempt. Queued, like every write."""
+        self._q.put(("__delivery__", (int(delivery_id), str(status), int(attempts),
+                                      next_attempt_at, error)))
+
+    def _write_delivery(self, delivery_id, status, attempts, next_at, error):
+        try:
+            self._conn.execute(
+                "UPDATE deliveries SET status=?, attempts=?, next_attempt_at=?,"
+                " last_error=?, sent_at=? WHERE id=?",
+                (status, attempts, next_at, error,
+                 time.time() if status == "sent" else None, delivery_id))
+            self._conn.commit()
+        except Exception as e:
+            print(f"[sqlite] delivery update failed for {delivery_id}: {e}")
+
     def put_event(self, row: dict):
         row.setdefault("run_id", self.run_id)
         if isinstance(row.get("detail_json"), (dict, list)):
@@ -374,6 +582,25 @@ class SqliteStore:
                     self._delete_frames(item[1])
                     last = time.monotonic()
                     continue
+                if item[0] == "__incident__":
+                    # Committed immediately rather than batched: the dispatcher
+                    # is polling for these, and holding an alert back for up to
+                    # commit_interval seconds to save one fsync is the wrong
+                    # trade for something a human is waiting on.
+                    count += self._commit(pending)
+                    self._write_incident(*item[1])
+                    last = time.monotonic()
+                    continue
+                if item[0] == "__delivery__":
+                    count += self._commit(pending)
+                    self._write_delivery(*item[1])
+                    last = time.monotonic()
+                    continue
+                if item[0] == "__prune__":
+                    count += self._commit(pending)
+                    self._run_prune(item[1])
+                    last = time.monotonic()
+                    continue
                 table, values = item
                 pending.setdefault(table, []).append(values)
                 count += 1
@@ -384,20 +611,93 @@ class SqliteStore:
                 last = time.monotonic()
 
     def _commit(self, pending: dict) -> int:
+        """Write one batch. Per-table isolation, and failures are counted.
+
+        Two deliberate changes from the naive version:
+
+        Per TABLE, not per batch. A schema mismatch on one table used to
+        discard every other table's rows in the same batch - up to batch_rows
+        (500) unrelated rows per collision. Now one bad table loses only its
+        own rows.
+
+        Counted, and escalating. A one-shot run could tolerate a printed line;
+        a service running for weeks cannot, because the loss is unbounded and
+        invisible. rows_failed/write_failures/last_write_error are readable by
+        a health endpoint, and FAILURE_ALARM_AFTER consecutive failures latches
+        write_alarm - which is the signal that this is persistent (a schema
+        mismatch, a full disk) rather than one transient lock.
+        """
         if not pending:
             return 0
-        n = 0
+        n = failed = 0
+        error = None
+        for table, rows in pending.items():
+            if not rows:
+                continue
+            try:
+                self._conn.executemany(_SQL[table], rows)
+                n += len(rows)
+            except Exception as e:
+                failed += len(rows)
+                error = f"{table}: {e}"
+                print(f"[sqlite] write failed, dropping {len(rows)} "
+                      f"{table} rows: {e}")
         try:
-            for table, rows in pending.items():
-                if rows:
-                    self._conn.executemany(_SQL[table], rows)
-                    n += len(rows)
             self._conn.commit()
-            self.rows_written += n
         except Exception as e:
-            print(f"[sqlite] write failed, dropping {n} rows: {e}")
+            failed += n
+            n = 0
+            error = f"commit: {e}"
+            print(f"[sqlite] commit failed, dropping {failed} rows: {e}")
         pending.clear()
+        if failed:
+            self.rows_failed += failed
+            self.write_failures += 1
+            self._consecutive_failures += 1
+            self.last_write_error = error
+            if self._consecutive_failures == self.FAILURE_ALARM_AFTER:
+                self.write_alarm = True
+                print(f"[sqlite] ALARM: {self._consecutive_failures} consecutive "
+                      f"failed writes ({self.rows_failed} rows lost so far). "
+                      f"This is not transient - last error: {error}")
+        else:
+            self._consecutive_failures = 0
+        self.rows_written += n
         return n
+
+    def health(self) -> dict:
+        """Writer-side counters, for a status endpoint or an end-of-run line."""
+        return {"rows_written": self.rows_written,
+                "queue_depth": self._q.qsize(),
+                "rows_dropped": self.rows_dropped,
+                "dropped_by_table": dict(self.dropped_by_table),
+                "rows_failed": self.rows_failed,
+                "write_failures": self.write_failures,
+                "write_alarm": self.write_alarm,
+                "last_write_error": self.last_write_error}
+
+    def prune(self, statements: list) -> None:
+        """Queue a list of (sql, params) row deletions for the writer thread.
+
+        Kept generic so retention policy lives in storage/retention.py rather
+        than here; this end only guarantees the statements run IN ORDER on the
+        writer's connection, which is what makes the caller's ordering
+        contract (deliveries before incidents, because a delivery references
+        an incident and crops are pinned by one) actually hold.
+        """
+        if statements:
+            self._q.put(("__prune__", list(statements)))
+
+    def _run_prune(self, statements: list) -> None:
+        for sql, params in statements:
+            try:
+                self._conn.execute(sql, params)
+            except Exception as e:
+                print(f"[sqlite] prune failed ({sql.split()[0:3]}): {e}")
+        try:
+            self._conn.commit()
+        except Exception as e:
+            print(f"[sqlite] prune commit failed: {e}")
 
     def _delete_frames(self, ids: list):
         try:
@@ -413,14 +713,15 @@ class SqliteStore:
         self._q.put(("__flush__", None))
         self._flushed.wait(timeout=10.0)
 
-    def close(self):
+    def close(self, end_run: bool = True):
         self._flushed.clear()
         self._q.put(("__stop__", None))
         self._thread.join(timeout=10.0)
-        try:
-            self.end_run()
-        except Exception:
-            pass
+        if end_run:
+            try:
+                self.end_run()
+            except Exception:
+                pass
         self._conn.close()
         try:
             self._rconn.close()

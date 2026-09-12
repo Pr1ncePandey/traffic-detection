@@ -5,10 +5,12 @@
   python query.py --class truck
   python query.py --plate HR26AF7196 [--fuzzy]
   python query.py --vehicle 7
+  python query.py --path 7
+  python query.py --yield
   python query.py --group person
   python query.py --flagged
 
-Identity note, and it has two levels:
+Identity note, and it has three levels:
 
   --id       ONE SIGHTING. An objects row, scoped to one run. A track id is
              only meaningful inside a run: ByteTrack mints a new one for
@@ -16,15 +18,28 @@ Identity note, and it has two levels:
   --vehicle  ONE CAR, across runs and cameras. A vehicles row, keyed on the
              plate, with every sighting that resolved to it. This is what
              --plate now reports as well.
+  --path     ONE CAR'S ROUTE. The same sightings as --vehicle, but ordered on
+             a comparable clock, collapsed per camera and split into trips.
+             Reports only observed hops: the stretch between two cameras is a
+             gap, never an inferred route. See src/journeys.py.
 
 A vehicle whose plate was never read confidently has no vehicles row at all -
 its sightings stay unlinked, which is honest rather than guessed.
+
+--yield answers the question to ask BEFORE trusting --path: how many vehicles
+were actually seen by more than one camera. Cross-camera identity needs two
+cameras to produce character-identical voted plates, so the honest expectation
+is a sparse and noisy hop set. If that count is zero, the work to do is plate
+accuracy, not journeys.
 """
 
 import argparse
+import datetime
 import os
 import re
 import sqlite3
+
+from src.journeys import build_path, yield_summary
 
 DB = "outputs/traffic.db"
 
@@ -40,6 +55,17 @@ def parse_args():
     p.add_argument("--plate", default=None)
     p.add_argument("--vehicle", type=int, default=None,
                    help="vehicle id - every sighting of one car")
+    p.add_argument("--path", type=int, default=None, metavar="V",
+                   help="vehicle id - the route it took across the camera "
+                        "fleet, as observed hops with gaps marked")
+    p.add_argument("--yield", dest="yield_", action="store_true",
+                   help="how many vehicles were seen by more than one camera "
+                        "(the measurement that makes --path worth reading)")
+    p.add_argument("--max-gap-s", type=float, default=None,
+                   help="--path: idle seconds that end one trip (default 1800)")
+    p.add_argument("--max-speed-kmh", type=float, default=None,
+                   help="--path: implied-speed ceiling above which a hop is "
+                        "flagged as a suspect identity (default 150)")
     p.add_argument("--fuzzy", action="store_true", help="tolerate up to 2 OCR typos")
     p.add_argument("--flagged", action="store_true", help="wrong-way / wrong-lane only")
     p.add_argument("--list", action="store_true")
@@ -100,6 +126,130 @@ def _show(conn, row):
               f"box=({b['x1']},{b['y1']},{b['x2']},{b['y2']}) conf={b['conf']:.2f}")
 
 
+def _clock(ts) -> str:
+    """Absolute epoch -> local wall-clock. Times in a path are real times."""
+    if ts is None:
+        return "?"
+    return datetime.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _duration(secs) -> str:
+    if secs is None:
+        return "?"
+    secs = float(secs)
+    if secs < 60:
+        return f"{secs:.0f}s"
+    if secs < 3600:
+        return f"{int(secs // 60)}m{int(secs % 60):02d}s"
+    return f"{int(secs // 3600)}h{int((secs % 3600) // 60):02d}m"
+
+
+def _show_path(path):
+    """Render one vehicle's route.
+
+    The gap line between visits is printed with a `~` and the word "unobserved"
+    on purpose: it is the one place a reader might otherwise assume the system
+    knows the car drove a particular way between two cameras. It does not.
+    """
+    plate = path.plate or "?"
+    print(f"\nVehicle V{path.vehicle_id}  plate {plate}")
+    print(f"  {path.total_sightings} sighting(s) on record across "
+          f"{len(path.cameras)} camera(s): {', '.join(path.cameras) or '-'}")
+
+    if path.conflicts:
+        # Impossible data, shown rather than silently resolved. One car cannot
+        # be at two cameras at once, so this plate is cloned or two different
+        # cars OCR'd to the same string - either way the identity below is not
+        # to be trusted, and the journey is still printed so the evidence is
+        # visible.
+        print(f"\n  CONFLICT: {len(path.conflicts)} pair(s) of sightings "
+              f"overlap in time - one vehicle cannot be at two cameras at "
+              f"once, so this plate is cloned or two cars read the same:")
+        for c in path.conflicts:
+            print(f"    {c.a.camera} {_clock(c.a.start)}..{_clock(c.a.end)}  "
+                  f"overlaps  {c.b.camera} {_clock(c.b.start)}..{_clock(c.b.end)}"
+                  f"  by {_duration(c.overlap_s)}")
+
+    if not path.journeys:
+        print("\n  No journey could be built: no sighting of this vehicle has "
+              "a clock that can be compared with another's.")
+    for n, j in enumerate(path.journeys, 1):
+        suffix = "  [contains suspect hops]" if j.suspect else ""
+        # No hops means one camera and no observed travel, so there is no
+        # distance to report - printing "0.00 km" would read as a measurement
+        # rather than as the absence of one.
+        if not j.hops:
+            dist = ", single camera"
+        elif j.distance_km is None:
+            dist = ", distance unknown"
+        else:
+            dist = f", {j.distance_km:.2f} km"
+        print(f"\n  Journey {n}/{len(path.journeys)}: {' -> '.join(j.cameras)}"
+              f"{suffix}")
+        span = None if j.start is None else float(j.end) - float(j.start)
+        print(f"    {_clock(j.start)} -> {_clock(j.end)}  "
+              f"({_duration(span)}{dist})")
+        for i, visit in enumerate(j.visits):
+            loc = ("" if visit.lat is None
+                   else f"  ({visit.lat:.5f},{visit.lon:.5f})")
+            n_sight = len(visit.sightings)
+            print(f"      {visit.camera:<16} {_clock(visit.start)}  "
+                  f"dwell {_duration(visit.dwell_s):<7} "
+                  f"{n_sight} sighting{'s' if n_sight != 1 else ' '}{loc}")
+            if i < len(j.hops):
+                _show_hop(j.hops[i])
+
+    if path.unorderable:
+        # Counted and named, never dropped: the difference between "seen twice"
+        # and "seen twice that we can place in time, plus four we cannot" is
+        # the whole difference between a result and a guess.
+        print(f"\n  {len(path.unorderable)} sighting(s) set aside as "
+              f"unorderable - no comparable clock:")
+        for s in path.unorderable:
+            print(f"    object #{s.object_id} at {s.camera}: {s.time_note}")
+        print("    Fix: re-run those file sources with --recorded-at so their "
+              "timestamps can be anchored.")
+
+
+def _show_hop(hop):
+    dist = "distance unknown" if hop.distance_km is None else f"{hop.distance_km:.2f} km"
+    speed = hop.speed_kmh
+    implied = "" if speed is None else f" -> {speed:.0f} km/h"
+    mark = ""
+    if hop.suspect:
+        mark = "   [SUSPECT: " + "; ".join(hop.suspect_reasons) + "]"
+    print(f"      {'~':<16} unobserved: {dist} in {_duration(hop.elapsed_s)}"
+          f"{implied}{mark}")
+
+
+def _show_yield(summary):
+    """Layer 0's number, with the two reasons it might be low kept apart."""
+    print("Cross-camera yield")
+    print(f"  cameras on record          : {summary['cameras']}")
+    print(f"  vehicles with a plate      : {summary['vehicles']}")
+    print(f"  seen by >1 camera          : {summary['multi_camera_vehicles']}")
+    if summary["unanchored_runs"]:
+        print(f"\n  {summary['unanchored_runs']} run(s) are file sources with no "
+              f"recorded_at, so their sightings can never be ordered against "
+              f"another camera. Re-run them with --recorded-at.")
+    if summary["runs_without_location"]:
+        print(f"  {summary['runs_without_location']} run(s) have no "
+              f"camera.location, so hops to or from them report no distance "
+              f"and cannot be speed-checked.")
+    if not summary["rows"]:
+        print("\n  No vehicle has been seen by more than one camera. Journeys "
+              "would be scaffolding around an empty set: the work to do is "
+              "plate accuracy (two cameras must produce character-identical "
+              "voted plates to link at all), not route assembly.")
+        return
+    print(f"\n{'vehicle':>8} {'cams':>5} {'sightings':>10}  plate")
+    for r in summary["rows"]:
+        print(f"{('V' + str(r['vehicle_id'])):>8} {r['cams']:>5} "
+              f"{r['sightings']:>10}  {r['plate'] or ''}")
+    print(f"\n{len(summary['rows'])} vehicle(s) with a cross-camera hop. "
+          f"Inspect one: python query.py --path <id>")
+
+
 def _table(rows):
     if not rows:
         print("No matches.")
@@ -125,7 +275,22 @@ def main():
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
 
-    if args.id is not None:
+    if args.yield_:
+        _show_yield(yield_summary(conn))
+    elif args.path is not None:
+        kwargs = {}
+        if args.max_gap_s is not None:
+            kwargs["max_gap_s"] = args.max_gap_s
+        if args.max_speed_kmh is not None:
+            kwargs["max_speed_kmh"] = args.max_speed_kmh
+        path = build_path(conn, args.path, **kwargs)
+        if path is None:
+            print(f"No vehicle V{args.path}. "
+                  f"Only a vehicle whose plate was read confidently has a row "
+                  f"at all; try: python query.py --yield")
+        else:
+            _show_path(path)
+    elif args.id is not None:
         row = conn.execute(_SELECT + " WHERE o.id=?", (args.id,)).fetchone()
         _show(conn, row) if row else print(f"No object #{args.id}.")
     elif args.track is not None:

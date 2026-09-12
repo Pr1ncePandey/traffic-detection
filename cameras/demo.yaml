@@ -26,10 +26,26 @@
 camera:
   name: "demo"           # vehicles flow bottom -> top in this view
 
+  # Where this camera physically is. Left unset here because the sample clip's
+  # real location is not known - and an invented one would be worse than none,
+  # since it would produce confident-looking distances and implied speeds for
+  # every hop through this camera. Unset means hops report "distance unknown".
+  # Fill it in for a real CCTV:
+  # location:
+  #   lat: 12.9716
+  #   lon: 77.5946
+
 video:
   # The camera owns its source, so this geometry cannot be applied to the
   # wrong footage by accident.
   source: "samples/input.mp4"
+
+  # When this footage was shot. Unset for the same reason as `location`: the
+  # sample's real recording time is unknown. Without it this run's timestamps
+  # stay clip-relative, so its sightings cannot be ordered against another
+  # camera's and `query.py --path` sets them aside as unorderable rather than
+  # guessing. Pass --recorded-at on the command line, or set it here:
+  # recorded_at: "2026-09-12T08:30:00"
 
 analyses:
   counting:

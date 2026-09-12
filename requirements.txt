@@ -6,6 +6,19 @@ tqdm
 numpy
 pyyaml
 
+# --- The service: serve.py, live dashboard, incident webhooks -------------
+# Only needed for `python serve.py`. `python main.py` (one camera, one shot)
+# runs without any of these.
+#
+# fastapi+uvicorn were chosen for first-class WebSocket support, which the
+# live dashboard depends on; uvicorn[standard] is what pulls the `websockets`
+# implementation in. httpx is the webhook client.
+#
+# Without them, serve.py exits with an install hint rather than a traceback.
+fastapi
+uvicorn[standard]
+httpx
+
 # --- Number-plate OCR backends -------------------------------------------
 # Pick one with `plate.ocr_backend` in config.yaml (or --ocr-backend). Vehicle
 # counting works with none of these installed; plate reading just stays empty

@@ -21,11 +21,11 @@ yolov8n.pt
 # clone with: git clone --depth 1 https://github.com/PaddlePaddle/PaddleOCR.git models/PaddleOCR)
 models/PaddleOCR/
 
+# OS junk
+.DS_Store
+Thumbs.db
+
 # LOCAL-ONLY tests (my machine): congestion self-test and its synthetic clips
 # stay here, never pushed - the repo keeps main system code only
 # (tools/test_reid.py is the shared PlateIdentity suite - tracked)
 tools/test_congestion.py
-
-# OS junk
-.DS_Store
-Thumbs.db

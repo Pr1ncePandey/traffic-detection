@@ -399,6 +399,260 @@ pixels on a front-on plate is the single biggest remaining win.
 | `outputs/summary.txt` | text summary |
 | `outputs/report.html` | HTML report, one card per object |
 
+## Multi-camera journeys
+
+Where did one car go? `objects.vehicle_id` is already fleet-global — one
+database serves every camera and `vehicles.plate` is `NOT NULL UNIQUE` — so a
+journey is structurally `objects WHERE vehicle_id = ?` ordered by time and
+joined to `runs`. Two things had to be fixed first.
+
+**Time had to become comparable.** The pipeline writes two incompatible kinds of
+number into `first_seen_s`: a wall-clock epoch for a live source, and
+seconds-from-clip-start for a file. Both landed in one column with nothing
+distinguishing them, so a fleet-wide database holding a live run and a file run
+made any `ORDER BY` time return silent nonsense. `runs.time_base` now records
+which clock a run used, and `--recorded-at` anchors a file's clip-seconds to
+when the footage was actually shot:
+
+```bash
+python main.py --camera junction_7 --recorded-at 2026-09-12T08:30:00
+```
+
+Storing the *processing* wall-clock instead does not work, and it is the obvious
+thing to reach for: process camera A's clip today and B's tomorrow and every A
+sighting precedes every B sighting; and within one run the gaps between
+detections are a function of throughput, so the ordering would encode GPU speed.
+See `src/timebase.py`.
+
+A file run with no `--recorded-at` is genuinely **unorderable**, and is reported
+as such rather than guessed at.
+
+**Cameras needed locations.** Set `camera.location` in `cameras/<id>.yaml`:
+
+```yaml
+camera:
+  location: {lat: 12.9716, lon: 77.5946}
+```
+
+It buys one thing worth more than it looks: haversine distance over elapsed time
+gives an implied speed per hop, and anything above `journey.max_speed_kmh` is an
+OCR collision or a cloned plate rather than a journey. That recovers most of
+what a road-topology graph would be wanted for with no topology file to
+maintain. The value is snapshotted onto the run row, so editing the yaml later
+cannot retroactively move a historical sighting.
+
+**Read the yield before trusting the routes.** Cross-camera identity needs two
+cameras to produce *character-identical* voted plates (`reid.fuzzy_distance` is
+0, deliberately), so the honest expectation is a sparse, noisy hop set:
+
+```bash
+python query.py --yield      # how many vehicles crossed more than one camera
+python query.py --path 7     # one vehicle's route
+```
+
+If the yield is zero, journeys would be scaffolding around an empty set and the
+work to do is plate accuracy, not route assembly. With one camera on the sample
+clips it *is* zero, for the reason in "The honest limits" above.
+
+### Reproducing it without a camera fleet
+
+`cameras/_twocam_north.yaml` and `_twocam_south.yaml` point at the **same**
+clip, anchored five minutes apart and placed 3.4 km apart, so every vehicle in
+the footage is seen by both cameras and there are real hops to assemble:
+
+```bash
+python main.py --camera _twocam_north --ocr-backend fast_plate
+python main.py --camera _twocam_south --ocr-backend fast_plate
+python query.py --yield        # 3 of 5 vehicles crossed both cameras
+python query.py --path 2
+```
+
+That yields genuine journeys at ~41 km/h from real detections. The failure
+modes come from re-anchoring one camera's clock: 20 s apart makes the hop
+813 km/h and it is flagged `[SUSPECT]`; identical anchors make it a `CONFLICT`;
+two hours apart splits it into two trips; removing `recorded_at` moves that
+sighting to `unorderable`.
+
+**What this does not prove.** It links because identical footage makes the OCR
+produce identical strings — right or wrong — and exact match is all re-id asks
+for. Two real cameras see different angles, lighting and plate sizes, and will
+not agree that readily. Read this rig as "the assembly works", never as
+"cross-camera re-id works"; only `--yield` on real footage answers the latter.
+The `_` prefix keeps these two out of `serve.py`'s camera discovery.
+
+Both rig files set `reid.min_conf: 0.4`, and that is the one thing in them not
+to copy to a real camera. The best plate read on this clip scores 0.53, under
+the 0.7 fleet default, so at the default exactly **one** vehicle binds and you
+see one hop rather than three. The default is higher than `plate.min_conf` on
+purpose — a read good enough to print on a box is not good enough to merge two
+vehicles' histories on, and a wrong merge is permanent. `--ocr-backend
+fast_plate` is needed because the default `paddle_anpr` is not installed by
+`requirements.txt`.
+
+```
+Vehicle V1  plate KA01AB1234
+  3 sighting(s) on record across 2 camera(s): cam_a, cam_b
+
+  Journey 1/1: cam_a -> cam_b
+    2026-09-12 13:30:00 -> 2026-09-12 13:36:00  (6m00s, 3.11 km)
+      cam_a            2026-09-12 13:30:00  dwell 40s     2 sightings
+      ~                unobserved: 3.11 km in 5m00s -> 37 km/h
+      cam_b            2026-09-12 13:35:40  dwell 20s     1 sighting
+```
+
+What it asserts is **only observed hops**. The stretch between two cameras is
+printed as a gap — the system saw a car at A and later at B, it did not see what
+happened in between and does not claim to. No intermediate camera is ever
+inferred. Consecutive sightings at one camera collapse into a single visit with
+a dwell time; an idle gap over `journey.max_gap_s` splits one trip from the
+next, because a car at A in the morning and at A again at night made two trips
+rather than a loop.
+
+Bad data is made visible rather than hidden. A hop implying 2 400 km/h is
+flagged `[SUSPECT]` and still printed, because a bad plate merge is worth
+seeing; deleting it would leave a plausible route with no sign its identity is
+wrong. Two sightings that overlap in time are reported as a `CONFLICT` — one car
+cannot be at two cameras at once, so that plate is cloned or two cars read the
+same — and the journey is still built, with the affected hops marked.
+
+## Running as a service
+
+`main.py` runs one camera once. `serve.py` runs every camera continuously,
+serves a live dashboard, and POSTs incidents to an external endpoint:
+
+```bash
+python serve.py                    # every cameras/*.yaml
+python serve.py --camera demo      # just one
+```
+
+Then open <http://127.0.0.1:8000/>. `/docs` has the API.
+
+One process holds N camera worker threads, **one** `SqliteStore` with its single
+writer thread, an in-process event bus, a WebSocket hub, a webhook dispatcher
+and the HTTP API. One store rather than N is not tidiness: `SqliteStore` is
+built around exactly one writer on one connection, and N stores would put N
+writer threads on one SQLite file.
+
+| Endpoint | |
+|---|---|
+| `GET /cameras` | configured cameras plus live status |
+| `GET /cameras/{id}` | detail: fps, queue depth, drops, counts |
+| `POST /cameras/{id}/start`, `/stop` | control plane |
+| `GET /incidents`, `/deliveries` | the outbox and its delivery state |
+| `GET /vehicles/{id}`, `/vehicles/{id}/path` | sightings, and journeys |
+| `GET /yield` | the cross-camera measurement above |
+| `GET /crops/{object_id}.jpg` | serves `objects.crop_path` |
+| `WS /live/{camera_id}` | frame metadata stream |
+
+**There is no application-level authentication.** The service is protected by
+network placement only, so it binds to `127.0.0.1` by default and `--host
+0.0.0.0` prints a warning. That default matters: `/crops` serves number-plate
+imagery and `/live` streams plate strings, so exposing this on an untrusted
+network publishes both. Put it behind a VPN or an authenticating proxy first.
+
+**On the GIL, honestly.** N camera threads only parallelise where the heavy work
+releases it. OpenCV and onnxruntime do for their compute kernels, so decode and
+inference genuinely overlap; the analysis stages, drawing and event handling are
+Python and serialise. Per-camera throughput therefore degrades non-linearly with
+camera count — `/cameras` reports each worker's achieved fps so you can measure
+it on your host rather than trust a promised number.
+
+### Live dashboard
+
+Metadata over WebSocket, drawn client-side — not video. About 30 boxes at ~120
+bytes is ~4 KB per message, and the hub pushes at a fixed ~8 Hz however fast the
+pipeline runs, so a viewer costs ~32 KB/s. Nobody can read 30 updates a second
+and a file replaying at 3× real time would otherwise flood the socket. A slow
+browser tab **drops frames rather than applying backpressure**: it must not be
+able to slow a camera.
+
+The health tiles are as much the point as the boxes: fps, write-queue depth,
+shed rows, lost rows, writer alarm, dropped frames, wrong-way and congestion
+totals. A camera that is silently dead is the failure mode this layer exists to
+make visible.
+
+### Incident webhooks
+
+| Event | Incident? | Why |
+|---|---|---|
+| `wrong_way` | yes | the motivating case |
+| `congestion` | yes, on state change | see below |
+| `wrong_lane` | configurable | noisier; depends on lane confidence |
+| `crossing` | **no** | fires for every vehicle. A counter, not an incident |
+| `vehicle_identified` | no | internal bookkeeping; fires on every rebind |
+
+Per-vehicle incidents fire **once, at track retirement** — the only moment the
+payload is complete, because that is when the plate vote has settled and the
+sharpest crop has been chosen. The cost is latency: `ttl_for()` floors at 5 s,
+so a webhook lands roughly time-in-frame + 5 s after the event. That is accepted
+deliberately, because the dashboard already serves anyone who needs to know
+sooner. Two consumers, two different requirements.
+
+Three rules exist because the simple version is wrong:
+
+- **Stuck tracks.** A parked car never reaches eviction, so "fire at
+  retirement" would never fire for exactly the stationary-obstruction case most
+  worth alerting on. After `incidents.max_dwell_s` of continuous flagging it
+  force-fires with `"state": "ongoing"` and whatever data exists, then is
+  suppressed permanently — no second webhook when it eventually retires, so
+  "fire once" stays true.
+- **Congestion has no track**, so retirement cannot trigger it. It fires on
+  `clear -> congested` and back, but only once the new state has *held* for
+  `congestion_dwell_s`; a metric sitting on its threshold would otherwise emit
+  hundreds of webhooks a minute. Both edges are emitted so a consumer can show
+  current state and compute a jam's duration from the pair.
+- **Absence is explicit.** `plate` and `vehicle_id` may be `null`, because a
+  vehicle whose plate never read confidently has no `vehicles` row at all. The
+  keys are present with null values rather than omitted.
+
+Delivery is a persisted **outbox**: `incidents` holds the payload, `deliveries`
+holds one row per subscriber. The incident is committed before any POST, so a
+crash between raising and sending loses nothing. Retries are exponential with a
+cap, then `status='dead'` — visible on the dashboard, because an endpoint that
+has been failing for a day should not require reading logs. Because `endpoint`
+lives on the delivery row, retries and dead-lettering are **per subscriber**:
+one broken consumer cannot delay another.
+
+Delivery is **at-least-once**, so consumers must be idempotent on
+`incident_id` — which is derived from the sighting rather than a clock
+precisely so it is stable across retries.
+
+```yaml
+incidents:
+  base_url: "https://traffic.internal"     # for image_url in the payload
+  kinds: {wrong_way: true, congestion: true, wrong_lane: false}
+  subscriptions:
+    - endpoint: "https://ops.example/hooks/traffic"
+      secret_env: "TRAFFIC_HOOK_SECRET"     # from the ENV, never this file
+      kinds: ["wrong_way"]
+      cameras: []                           # [] = every camera
+```
+
+Signed with HMAC-SHA256 over `timestamp + "." + body` in `X-Signature`. The
+timestamp is *inside* the signed material, not merely alongside it, so a
+captured POST cannot be replayed later.
+
+### Retention
+
+Two things were previously unbounded and only became dangerous once something
+ran for a week. Crops were **never reaped at all** — the frame `Reaper` only
+ever touched the `frames` table — so one JPEG per object accumulated forever.
+And `events`, the highest-volume table, had no cap.
+
+Both now have budgets, `0` meaning unlimited exactly as `frames.retention`
+already did, so there is one retention idiom rather than two. Nothing is deleted
+that an operator did not ask to have deleted.
+
+The crop policy is **keep what an incident references, reap the rest**. A crop
+pinned by a retained incident survives until that incident is itself reaped, so
+a delivered `image_url` stays valid for exactly as long as its incident. Two
+consequences are built for deliberately: the byte-targeted pass *skips* pinned
+crops and keeps going rather than stopping at the first one; and because
+incident retention is unlimited by default, incident volume sets a disk floor
+the crop budget cannot reclaim — so the dashboard reports pinned bytes
+separately from reclaimable ones, to make that floor visible before it is a full
+disk.
+
 ## Setup and usage
 
 Python 3.10+. A virtual environment is required on macOS with Homebrew Python (PEP 668):
@@ -488,8 +742,22 @@ src/analysis/    use cases + the registry and scheduler:
                    lane_calibration.py learn the divider; verify a config
                    lanes.py            wrong-side detection (staged)
                    counting.py anpr.py congestion.py
-src/storage/     SQLite backend, frame writers, retention reaper
+src/storage/     SQLite backend, frame writers, retention:
+                   sqlite_store.py     one writer thread, the outbox tables
+                   frames.py           frame writers + the frame reaper
+                   retention.py        crop pinning and row caps
+src/timebase.py  epoch vs clip-seconds - the only reader of runs.time_base
+src/journeys.py  multi-camera route assembly (offline, read-only)
+src/incidents.py incident POLICY: what fires, when, and the payload
+src/server/      the long-running service:
+                   app.py              FastAPI endpoints + WebSocket
+                   workers.py          one supervised thread per camera
+                   hub.py              live fan-out, throttled, drops for slow
+                   webhooks.py         outbox DELIVERY: retry, dead-letter
+                   dashboard.py        the single-page UI
 src/pipeline.py  orchestrator (owns the loop, knows no individual use case)
+main.py          one camera, one shot
+serve.py         every camera, continuously
 ```
 
 ## Scope and next steps
@@ -498,7 +766,8 @@ In scope now: file / RTSP / webcam input at a configurable analysis rate; all-CO
 detection with grouping; tracking; two-zone counting; lane direction and
 wrong-way flags; number plates; plate-keyed vehicle re-identification across
 re-entries, runs and cameras; congestion levels; object-level SQLite storage
-with every frame retained.
+with every frame retained; multi-camera journey reconstruction; a long-running
+service with a live dashboard, incident webhooks and disk/row retention.
 
 Known limits, stated plainly:
 - COCO cannot name potholes, debris, cones or barriers (see above).
@@ -516,6 +785,20 @@ Known limits, stated plainly:
 - A lane whose traffic is never observed during warmup reports `no-data`, and
   its configured direction stays unverified — an absence of alerts from it
   means nothing either way.
+- Multi-camera journeys inherit that exact-match cap: two cameras must produce
+  character-identical voted plates to link at all, so the hop set is sparse and
+  noisy rather than a dense trail. `python query.py --yield` is the measurement
+  to take before reading any route. The `_twocam_*` rig above returns 3 of 5,
+  but only because identical footage makes the OCR err identically; a single
+  camera on the sample clips returns zero, and no real two-camera yield has
+  been measured here.
+- A journey asserts only observed hops. It cannot tell you that an A→D hop
+  skipped B and C, because it never claims intermediate positions at all.
+- The service has no application-level auth and defaults to loopback; that is a
+  deployment assumption, not a feature.
+- N camera threads share a GIL, so throughput per camera falls non-linearly
+  with camera count. Measure it on your host; the fallback if it does not hold
+  up is worker processes plus one writer process fed over a queue.
 - In `auto` mode the lane is the convex hull of where warmup traffic actually
 drove, so an object in a part of the road nothing used during warmup reads
 as off-lane and gets no verdict. On the full Indian-clip run that is

@@ -1,0 +1,42 @@
+# DASHBOARD DEMO CAMERA. demo.yaml with the near carriageway's configured flow
+# DELIBERATELY INVERTED, so real detections produce real wrong_way verdicts and
+# the incident path can be seen end to end without staging footage.
+#
+# This is what a MISCALIBRATED camera looks like, not what wrong-way traffic
+# looks like. on_mismatch: warn is what keeps the verdicts flowing - the
+# default `suppress` would (correctly) switch wrong-way checking off the moment
+# it noticed the geometry contradicts observed motion.
+#
+# The `_` prefix keeps it out of serve.py's camera discovery. Never copy this.
+
+camera:
+  name: "dash_demo"
+  location: {lat: 12.9716, lon: 77.5946}
+
+video:
+  source: "samples/input.mp4"
+  recorded_at: "2026-09-12T08:30:00"
+
+analyses:
+  counting:
+    zones: {line_a_ratio: 0.35, line_b_ratio: 0.65,
+            label_a: "bottom (entry)", label_b: "top (exit)"}
+  lanes:
+    mode: "explicit"
+    rules:
+      warmup_frames: 24      # short, so alerts start almost immediately
+      on_mismatch: "warn"    # keep judging against the inverted geometry
+    divider:
+      points: [[0.356, 0.0], [0.072, 1.0]]
+    lanes:
+      - name: "right_going"
+        polygon: [[0.356, 0.0], [1.0, 0.0], [1.0, 1.0], [0.072, 1.0]]
+        flow: [0.076, 0.997]    # INVERTED: real traffic here goes UP the frame
+        allowed: []
+      - name: "left_coming"
+        polygon: [[0.0, 0.0], [0.356, 0.0], [0.072, 1.0], [0.0, 1.0]]
+        flow: [-0.076, -0.997]  # also inverted
+        allowed: []
+
+reid:
+  min_conf: 0.4

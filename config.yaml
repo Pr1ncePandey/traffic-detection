@@ -11,6 +11,23 @@ camera:
   id: "demo"             # cameras/<id>.yaml, and the {camera_id} in output paths
   name: "demo"           # what a human reads in the report
 
+  # WHERE THIS CAMERA IS. Set it per camera in cameras/<id>.yaml, not here.
+  #
+  # Used for one thing, and it is worth more than it looks: the haversine
+  # distance between two cameras divided by the time between two sightings
+  # gives an implied speed for that hop, and anything above
+  # journey.max_speed_kmh is an OCR collision or a cloned plate rather than a
+  # journey. That recovers most of what a road-topology graph would be wanted
+  # for, with no topology file to maintain.
+  #
+  # null/null means "unknown", and a hop to or from such a camera reports no
+  # distance rather than 0 km - a 0 km hop would silently pass the very check
+  # above. The value is SNAPSHOT onto the run row when a run starts, so editing
+  # this file later cannot retroactively move a historical sighting.
+  location:
+    lat: null            # e.g. 12.9716
+    lon: null            # e.g. 77.5946
+
 video:
   # A camera normally declares its own `source` in cameras/<id>.yaml, so its
   # geometry cannot be paired with the wrong footage. --source overrides.
@@ -19,6 +36,21 @@ video:
   csv: "outputs/{camera_id}/tracks.csv"
   summary: "outputs/{camera_id}/summary.txt"
   write_video: true
+
+  # WHEN THE FOOTAGE STARTS - unix epoch, or ISO-8601 ("2026-09-12T08:30:00",
+  # read in local time if it carries no offset). --recorded-at overrides.
+  #
+  # FILE SOURCES ONLY, and they need it to take part in any cross-camera
+  # question at all. A file's frame timestamps are seconds-from-clip-start, so
+  # every clip begins at 0 and camera A@12.4s vs camera B@8.1s says nothing
+  # about which happened first. This anchors them to real time. Live sources
+  # are already on wall-clock and ignore this.
+  #
+  # Leaving it null is legal and honest: those sightings are reported by
+  # `query.py --path` as unorderable and set aside, rather than guessed at.
+  # Storing the PROCESSING time instead would not fix it - see src/timebase.py
+  # for why that encodes GPU speed rather than traffic.
+  recorded_at: null
 
 source:                  # live sources only (rtsp:// / http:// / webcam index)
   reconnect: true        # RTSP drops routinely; reconnect with backoff
@@ -286,3 +318,26 @@ reid:                    # DURABLE IDENTITY - the same car keeps one id
   cache_size: 4096       # plate -> id LRU. A miss costs one indexed lookup, so
                          # this only has to cover the plates in flight; the cap
                          # is what keeps a 24/7 feed's memory flat.
+
+journey:                 # MULTI-CAMERA ROUTES (offline; see src/journeys.py)
+  # `query.py --path V` reconstructs where one car went across the fleet from
+  # the sightings that resolved to the same vehicle id. It reports only
+  # OBSERVED hops: the stretch between two cameras is printed as a gap, never
+  # as an inferred route, and no intermediate camera is ever asserted.
+  #
+  # Read `query.py --yield` FIRST. Cross-camera identity needs two cameras to
+  # produce character-identical voted plates (fuzzy_distance is 0 above), so
+  # the honest expectation is a sparse, noisy hop set. If the yield is zero,
+  # the work to do is plate accuracy, not route assembly.
+  max_gap_s: 1800        # idle seconds that end one trip and begin another.
+                         # A car at camera A in the morning and at A again at
+                         # night made two trips; it did not loop. Measured from
+                         # LEAVING one camera to ARRIVING at the next, so a long
+                         # dwell in one camera's view does not split a trip.
+  max_speed_kmh: 150     # implied-speed ceiling per hop (haversine distance
+                         # over elapsed time). Above this, the two sightings are
+                         # not one car. Such hops are FLAGGED, never dropped: a
+                         # bad plate merge is worth seeing, and deleting it
+                         # would leave a plausible-looking route with no sign
+                         # that its identity is wrong. Needs camera.location at
+                         # both ends; without it a hop cannot be speed-checked.

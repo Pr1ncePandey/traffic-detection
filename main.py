@@ -24,6 +24,12 @@ def parse_args():
     p.add_argument("--source", default=None,
                    help="override the camera's source: video file, rtsp:// or "
                         "http:// URL, or a webcam index like 0")
+    p.add_argument("--recorded-at", default=None,
+                   help="when the FOOTAGE starts: unix epoch or ISO-8601 "
+                        "(2026-09-12T08:30:00). File sources only - without it "
+                        "this run's timestamps are clip-relative and cannot be "
+                        "ordered against another camera. Live sources are "
+                        "already on wall-clock and ignore it.")
     p.add_argument("--target", default=None)
     p.add_argument("--csv", default=None)
     p.add_argument("--db", default=None, help="SQLite path (default outputs/traffic.db)")
@@ -104,6 +110,7 @@ def main():
 
     model = cfg["perception"]["model"]
     if args.source: cfg["video"]["source"] = args.source
+    if args.recorded_at: cfg["video"]["recorded_at"] = args.recorded_at
     if args.target: cfg["video"]["target"] = args.target
     if args.csv: cfg["video"]["csv"] = args.csv
     if args.db: cfg.setdefault("storage", {})["path"] = args.db

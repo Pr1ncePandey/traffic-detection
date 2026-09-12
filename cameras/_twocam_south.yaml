@@ -1,0 +1,41 @@
+# TWO-CAMERA TEST RIG, second of a pair. See cameras/twocam_north.yaml for why.
+#
+# Both files point at the SAME clip on purpose, so every vehicle in it is
+# "seen" by both cameras and the journey machinery has real hops to assemble.
+# What this exercises is the PLUMBING - time anchoring, hop assembly, distance
+# and implied-speed gating - not cross-camera OCR accuracy. See the note in
+# twocam_north.yaml before reading anything into the hop count.
+
+camera:
+  name: "twocam_south"
+  location: {lat: 12.9958, lon: 77.6138}
+
+video:
+  source: "samples/indian_road.mp4"
+  # The two cameras are anchored 5 minutes apart, so a car at clip-second
+  # 12.4 lands at 08:00:12.4 here and 08:05:12.4 at the other camera - a
+  # clean 300 s hop over ~3.5 km, i.e. ~42 km/h. Well under max_speed_kmh.
+  recorded_at: "2026-09-12T08:05:00"
+
+analyses:
+  counting:
+    zones: {line_a_ratio: 0.35, line_b_ratio: 0.65,
+            label_a: "top (entry)", label_b: "bottom (exit)"}
+  lanes:
+    mode: "explicit"
+    lanes:
+      - name: "carriageway"
+        polygon: [[0.2448, 1.0], [0.412, 0.1], [0.4354, 0.0398], [0.4536, 0.0009], [0.6156, 0.0], [0.6161, 0.0], [0.9005, 0.2815], [1.0, 0.4306], [1.0, 0.4426], [1.0, 0.6352], [0.9922, 1.0], [0.2792, 1.0]]
+        flow: [0.2501, 0.9682]
+        allowed: []
+
+# Loosened FOR THIS RIG ONLY. The best plate read on this clip scores 0.53,
+# under the 0.7 fleet default, so at the default exactly one vehicle binds and
+# the rig demonstrates one hop instead of three. 0.4 lets the weaker reads
+# bind so there is more than one journey to look at.
+#
+# Do NOT copy this to a real camera. The default is higher than plate.min_conf
+# deliberately: a read good enough to PRINT on a box is not good enough to
+# merge two vehicles' histories on, and a wrong merge is permanent.
+reid:
+  min_conf: 0.4
