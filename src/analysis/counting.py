@@ -4,7 +4,7 @@ packaging.
 """
 
 from ..detectors.classes import VEHICLE
-from .base import register
+from .base import block, register
 from .line_counter import ZoneCounter
 
 
@@ -13,18 +13,18 @@ class CountingAnalyzer:
 
     def __init__(self, cfg: dict):
         self._cfg = cfg or {}
+        conf = block(cfg, self.name)
         self.zone = None
-        self.vehicles_only = bool(self._cfg.get("counting", {})
-                                  .get("vehicles_only", True))
+        self.vehicles_only = bool(conf.get("vehicles_only", True))
         self.a_to_b = 0
         self.b_to_a = 0
 
     def setup(self, source, cfg: dict):
-        self.zone = ZoneCounter(cfg.get("camera", {}), source.height,
-                                legacy=cfg.get("counting_line", {}))
-        # --no-line / counting_line.enabled:false still hides the zones.
-        if not cfg.get("counting_line", {}).get("enabled", True):
-            self.zone.enabled = False
+        # The zone lines are a property of THIS analysis, not of the camera's
+        # identity, so they live in analyses.counting.zones rather than in the
+        # camera block they used to share with the camera's name.
+        self.zone = ZoneCounter(block(cfg, self.name).get("zones", {}),
+                                source.height)
 
     def process(self, ctx):
         store = ctx.store

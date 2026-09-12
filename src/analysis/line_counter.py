@@ -1,8 +1,8 @@
 """Counting logic + drawing. ZoneCounter (two lines A/B) is primary.
 
 Direction-neutral: code counts A->B and B->A only. Human labels
-("bottom entry" -> "top exit") live in config camera block, one file per CCTV.
-Single-line LineCounter kept for backward compat / --no-line tests.
+("bottom entry" -> "top exit") live in analyses.counting.zones, overridable
+per camera. Single-line LineCounter is kept for the --no-line tests.
 """
 
 import cv2
@@ -11,14 +11,9 @@ import cv2
 class ZoneCounter:
     """Two lines: A (lower, entry side) and B (upper, exit side)."""
 
-    def __init__(self, cfg: dict, frame_h: int, legacy: dict | None = None):
+    def __init__(self, cfg: dict, frame_h: int):
         cfg = cfg or {}
-        # Fallback to legacy single line: split it into a band around it.
-        if not cfg and legacy:
-            y = float(legacy.get("y_ratio", 0.6))
-            cfg = {"line_a_ratio": max(0.05, y - 0.15), "line_b_ratio": min(0.95, y + 0.15)}
-        self.enabled = bool(cfg.get("enabled", True) if "enabled" in cfg
-                            else (legacy.get("enabled", True) if legacy else True))
+        self.enabled = bool(cfg.get("enabled", True))
         self.a_ratio = float(cfg.get("line_a_ratio", 0.35))
         self.b_ratio = float(cfg.get("line_b_ratio", 0.65))
         self.label_a = str(cfg.get("label_a", "bottom (entry)"))

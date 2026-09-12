@@ -4,13 +4,21 @@
   python query.py --id 42
   python query.py --class truck
   python query.py --plate HR26AF7196 [--fuzzy]
+  python query.py --vehicle 7
   python query.py --group person
   python query.py --flagged
 
-Identity note: a track id identifies an object only WITHIN one run - ByteTrack
-mints a new id for anything that leaves and re-enters. The plate is the key
-that survives across runs and cameras, which is why --plate searches every run
-while --id is scoped to one object row.
+Identity note, and it has two levels:
+
+  --id       ONE SIGHTING. An objects row, scoped to one run. A track id is
+             only meaningful inside a run: ByteTrack mints a new one for
+             anything that leaves and re-enters.
+  --vehicle  ONE CAR, across runs and cameras. A vehicles row, keyed on the
+             plate, with every sighting that resolved to it. This is what
+             --plate now reports as well.
+
+A vehicle whose plate was never read confidently has no vehicles row at all -
+its sightings stay unlinked, which is honest rather than guessed.
 """
 
 import argparse
@@ -30,6 +38,8 @@ def parse_args():
     p.add_argument("--group", default=None,
                    help="vehicle | person | animal | obstacle | infrastructure")
     p.add_argument("--plate", default=None)
+    p.add_argument("--vehicle", type=int, default=None,
+                   help="vehicle id - every sighting of one car")
     p.add_argument("--fuzzy", action="store_true", help="tolerate up to 2 OCR typos")
     p.add_argument("--flagged", action="store_true", help="wrong-way / wrong-lane only")
     p.add_argument("--list", action="store_true")
@@ -56,6 +66,14 @@ FROM objects o
 
 def _show(conn, row):
     print(f"\nObject #{row['id']}  (track {row['track_id']}, run {row['run_id']})")
+    vid = row["vehicle_id"] if "vehicle_id" in row.keys() else None
+    if vid is not None:
+        veh = conn.execute("SELECT plate FROM vehicles WHERE id=?", (vid,)).fetchone()
+        n = conn.execute("SELECT COUNT(*) n FROM objects WHERE vehicle_id=?",
+                         (vid,)).fetchone()["n"]
+        plate = veh["plate"] if veh else "?"
+        print(f"  Vehicle   : V{vid} ({plate}) - "
+              f"{n} sighting{'s' if n != 1 else ''} on record")
     print(f"  Class     : {row['cls_name']}  [{row['cls_group']}]")
     print(f"  Seen      : {row['frames_seen']} frames, "
           f"{(row['first_seen_s'] or 0):.2f}s -> {(row['last_seen_s'] or 0):.2f}s")
@@ -86,10 +104,13 @@ def _table(rows):
     if not rows:
         print("No matches.")
         return
-    print(f"{'id':>5} {'track':>6} {'class':<12} {'group':<14} "
+    print(f"{'id':>5} {'track':>6} {'veh':>5} {'class':<12} {'group':<14} "
           f"{'frames':>6} {'conf':>5} {'flag':<10} plate")
     for r in rows:
-        print(f"{r['id']:>5} {r['track_id']:>6} {str(r['cls_name'] or ''):<12} "
+        vid = r["vehicle_id"] if "vehicle_id" in r.keys() else None
+        print(f"{r['id']:>5} {r['track_id']:>6} "
+              f"{('V' + str(vid)) if vid is not None else '-':>5} "
+              f"{str(r['cls_name'] or ''):<12} "
               f"{str(r['cls_group'] or ''):<14} {r['frames_seen']:>6} "
               f"{(r['best_conf'] or 0):>5.2f} {str(r['lane_flag'] or 'ok'):<10} "
               f"{r['plate'] or ''}")
@@ -114,8 +135,31 @@ def main():
             print(f"No track {args.track}.")
         for r in rows:
             _show(conn, r)
+    elif args.vehicle is not None:
+        veh = conn.execute("SELECT * FROM vehicles WHERE id=?",
+                           (args.vehicle,)).fetchone()
+        if veh is None:
+            print(f"No vehicle V{args.vehicle}.")
+        else:
+            print(f"Vehicle V{veh['id']}  plate {veh['plate']}")
+            print(f"  First seen: {(veh['first_seen_at'] or 0):.2f}"
+                  f"   Last seen: {(veh['last_seen_at'] or 0):.2f}")
+            rows = conn.execute(_SELECT + " WHERE o.vehicle_id=?"
+                                " ORDER BY o.run_id, o.first_seen_s",
+                                (args.vehicle,)).fetchall()
+            print(f"  {len(rows)} sighting(s):")
+            for r in rows:
+                _show(conn, r)
     elif args.plate:
         want = _norm(args.plate)
+        # Exact hits go through the vehicles table, which is the indexed,
+        # cross-run answer. The attributes scan below still runs, so a sighting
+        # whose plate was read but never confident enough to bind is not lost.
+        veh = conn.execute("SELECT * FROM vehicles WHERE plate=?", (want,)).fetchone()
+        if veh is not None:
+            print(f"Vehicle V{veh['id']}  plate {veh['plate']}  "
+                  f"({(veh['first_seen_at'] or 0):.2f}s -> "
+                  f"{(veh['last_seen_at'] or 0):.2f}s)")
         rows = conn.execute(_SELECT + " WHERE o.id IN (SELECT object_id FROM"
                             " attributes WHERE key='plate_number')").fetchall()
         hits = [r for r in rows

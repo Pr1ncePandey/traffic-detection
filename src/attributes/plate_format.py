@@ -197,3 +197,27 @@ def correct(text: str):
             return (text, False, 0)
 
     return (text, False, 0)
+
+
+def fits_template(text: str) -> bool:
+    """True when `text` is a clean fit to a real Indian registration template.
+
+    The gate for keying an IDENTITY on a plate, which is a stricter question
+    than looks_like_plate() answers. That one only asks for 4+ alphanumerics
+    mixing letters and digits, so the 'IND' band on an HSRP plate joined to a
+    couple of digits passes it - fine for displaying a best-effort read, far
+    too loose to merge two sightings into one vehicle on.
+
+    Repair-free by design: correct() is allowed MAX_REPAIRS cross-class fixes
+    because a displayed plate is better approximately right than blank, but a
+    repaired character is a guess, and a guess in an identity key silently
+    fuses two vehicles.
+
+    Delegates to correct() rather than _best_fit() so this agrees with what the
+    reader actually produced, window slide included: a plate read as
+    'INDHR26DK8337' is a clean fit once the HSRP band is dropped, and deciding
+    otherwise here would refuse identity to exactly the plates correct() was
+    written to rescue.
+    """
+    _fitted, matched, repairs = correct(normalize(text))
+    return bool(matched) and repairs == 0

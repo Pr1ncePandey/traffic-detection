@@ -64,7 +64,7 @@ class Thresholds:
     """The tunables, in one place, all named in the units they are measured in.
 
     Defaults come from the two sample clips; every one of them is a
-    `lanes_rules:` key in config.yaml so a new camera is a config change.
+    `analyses.lanes.rules` block in config, so a new camera is a config change.
     """
 
     def __init__(self, cfg: dict | None = None):

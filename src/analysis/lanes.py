@@ -19,8 +19,8 @@ The divider was a hand-typed constant tuned on one clip and inherited by every
 other source unchecked. On samples/plate_test.mp4 it cut diagonally through
 the middle of a single one-way carriageway: 2 of 90 vehicle tracks were
 reported wrong-way, both driving correctly, 0 real offenders. So the geometry
-is now either learned from motion (`lanes_mode: auto`) or CHECKED against
-motion (`lanes_mode: explicit`), during a warmup window in which no alert is
+is now either learned from motion (`analyses.lanes.mode: auto`) or CHECKED against
+motion (`analyses.lanes.mode: explicit`), during a warmup window in which no alert is
 raised. A configured lane whose traffic demonstrably flows the other way is
 now reported at startup instead of generating a false alert per vehicle for
 the rest of the run.
@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 
 from ..detectors.classes import ON_ROAD, VEHICLE
-from .base import Findings, register
+from .base import Findings, block, register
 from .geometry import describe_vector, unit
 from .lane_calibration import MotionSurvey
 from .lane_model import (OK, WRONG_LANE, WRONG_WAY, WRONG_WAY_AND_LANE,
@@ -97,23 +97,25 @@ class LaneAnalyzer:
         cfg = cfg or {}
         self.width = int(getattr(source, "width", 0) or 0)
         self.height = int(getattr(source, "height", 0) or 0)
-        self.mode = str(cfg.get("lanes_mode", "explicit")).lower()
-        rules = dict(cfg.get("lanes_rules", {}) or {})
+        conf = block(cfg, self.name)
+        self.mode = str(conf.get("mode", "explicit")).lower()
+        rules = dict(conf.get("rules", {}) or {})
         self.on_mismatch = str(rules.get("on_mismatch", "suppress")).lower()
         self.warmup_frames = max(0, int(rules.get("warmup_frames", 120)))
         thresholds = Thresholds(rules)
 
         if self.mode == "off":
             self.enabled = False
-            self._note("lanes_mode: off - no lane or wrong-way analysis")
+            self._note("analyses.lanes.mode: off - no lane or wrong-way analysis")
             return
 
-        lanes_cfg = cfg.get("lanes", []) or []
+        lanes_cfg = conf.get("lanes", []) or []
         if self.mode == "explicit" and not lanes_cfg:
             # Falling back to `auto` beats running with no lanes at all, and
             # beats the old behaviour of silently using another clip's numbers.
-            self._note("lanes_mode: explicit but no lanes configured; "
-                       "measuring from motion instead (lanes_mode: auto)")
+            self._note("analyses.lanes.mode: explicit but no lanes "
+                       "configured; measuring from motion instead "
+                       "(mode: auto)")
             self.mode = "auto"
 
         if self.mode == "auto":
@@ -122,8 +124,8 @@ class LaneAnalyzer:
         else:
             self.model = LaneModel.from_config(
                 lanes_cfg, self.width, self.height,
-                divider_cfg=cfg.get("divider"), rules=rules,
-                units=cfg.get("lanes_units", "auto"))
+                divider_cfg=conf.get("divider"), rules=rules,
+                units=conf.get("units", "auto"))
 
         if self.warmup_frames > 0:
             self.survey = MotionSurvey(
@@ -135,7 +137,8 @@ class LaneAnalyzer:
                 opposing_min_frac=float(rules.get("opposing_min_frac", 0.12)),
                 align_cos=thresholds.align_cos)
         elif self.mode == "auto":
-            self._note("lanes_mode: auto needs warmup_frames > 0 to measure "
+            self._note("analyses.lanes.mode: auto needs rules.warmup_frames > 0 to "
+                       "measure "
                        "anything; lane analysis disabled")
             self.enabled = False
             return
@@ -236,7 +239,7 @@ class LaneAnalyzer:
             suggestion.lanes, self.width, self.height,
             divider_cfg=({"points": suggestion.divider.as_points(),
                           "units": "pixel"} if suggestion.divider else None),
-            rules=self._cfg.get("lanes_rules", {}) or {}, units="pixel",
+            rules=block(self._cfg, self.name).get("rules", {}) or {}, units="pixel",
             verbose=False)
         self.model.note = "learned from motion"
         for lane in self.model.lanes:
@@ -280,7 +283,7 @@ class LaneAnalyzer:
             print(f"[lanes] on_mismatch=suppress: wrong-way checking disabled "
                   f"for {', '.join(names)}; every other lane keeps working. "
                   f"Fix the geometry (tools/calibrate.py --verify) or set "
-                  f"lanes_rules.on_mismatch: flip to trust the measurement.")
+                  f"analyses.lanes.rules.on_mismatch: flip to trust the measurement.")
             self._note(f"wrong-way checking suppressed on {', '.join(names)}: "
                        f"the configured flow contradicts observed motion")
         elif self.on_mismatch == "flip":
@@ -293,7 +296,7 @@ class LaneAnalyzer:
                 print(f"[lanes] on_mismatch=flip: lane {row['lane']!r} flow "
                       f"corrected to {describe_vector(row['observed'])}")
             self._note(f"corrected the configured flow of {', '.join(names)} "
-                       f"from observed motion (lanes_rules.on_mismatch: flip)")
+                       f"from observed motion (analyses.lanes.rules.on_mismatch: flip)")
         elif self.on_mismatch == "off":
             self.enabled = False
             print("[lanes] on_mismatch=off: lane analysis disabled rather than "
@@ -302,7 +305,7 @@ class LaneAnalyzer:
         else:
             self._note(f"WARNING: {', '.join(names)} contradict observed "
                        f"motion; wrong-way alerts from them are unreliable. "
-                       f"Fix the geometry, or set lanes_rules.on_mismatch: "
+                       f"Fix the geometry, or set analyses.lanes.rules.on_mismatch: "
                        f"flip to trust the measurement instead.")
 
     # --- apply / draw (serial, main thread) --------------------------------

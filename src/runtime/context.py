@@ -2,9 +2,11 @@
 
 There are two shapes, and the difference is the whole point:
 
-  AnalysisView   READ-ONLY. What the compute phase of an analyzer sees. No
-                 frame to draw on, no TrackStore to mutate, no other
-                 analyzer's output. A compute phase that reads only this can
+  AnalysisView   READ-ONLY. What the compute phase of a plugin sees. No
+                 frame to draw on, no TrackStore to mutate. It DOES carry the
+                 attributes the perception stage already produced, which is
+                 what lets an analysis filter on a plate or a colour; it
+                 carries them as an immutable snapshot, so a compute phase can
                  be moved to a worker thread without a single lock.
 
   FrameContext   the mutable frame. Only the apply and draw phases get it,
@@ -15,7 +17,8 @@ else touches one adapter instead of every analyzer.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from types import MappingProxyType
+from typing import Any, Mapping, NamedTuple
 
 import numpy as np
 
@@ -70,12 +73,25 @@ class Detection:
         return max(0, x2 - x1) * max(0, y2 - y1)
 
 
+_NO_ATTRS: Mapping = MappingProxyType({})
+
+
 class TrackedBox(NamedTuple):
     """An immutable snapshot of one Detection, for the compute phase.
 
     A tuple rather than the Detection itself so that a compute phase CANNOT
     write to shared state even by accident - the "pure function" contract is
     enforced by the type instead of by a comment nobody reads.
+
+    `attrs` is what makes the perception stage useful to the analyses: by the
+    time an analysis computes, the enrichers have already run, so the plate and
+    colour of this object are readable here. Without it no analysis could
+    filter on an attribute, however the stages were ordered. It is a read-only
+    snapshot - a copy behind a MappingProxyType - so a worker thread cannot
+    reach back into the live detection.
+
+    `prev_xy` is promoted to a named field because every motion-based analysis
+    needs it and digging it out of a free-form dict is how it gets missed.
     """
 
     track_id: int | None
@@ -83,6 +99,8 @@ class TrackedBox(NamedTuple):
     group: str
     conf: float
     bbox: tuple[int, int, int, int]
+    prev_xy: tuple | None = None
+    attrs: Mapping = _NO_ATTRS
 
     @property
     def centroid(self) -> tuple[int, int]:
@@ -105,7 +123,10 @@ class TrackedBox(NamedTuple):
 
     @classmethod
     def of(cls, det: Detection) -> "TrackedBox":
-        return cls(det.track_id, det.cls_name, det.group, det.conf, det.bbox)
+        extra = det.extra or {}
+        return cls(det.track_id, det.cls_name, det.group, det.conf, det.bbox,
+                   prev_xy=extra.get("prev_xy"),
+                   attrs=MappingProxyType(dict(extra)) if extra else _NO_ATTRS)
 
 
 @dataclass(frozen=True)

@@ -14,8 +14,11 @@ Swap the model with `plate.ocr_backend` in config.yaml - no code change:
 Compare them on your own footage with tools/bench_ocr.py.
 
 Identity rule: ByteTrack ID = same car WITHIN one video; plate_number = same
-car ACROSS videos/cameras (the journey key). Best-crop voting (max 3
-tries/vehicle) lives in base.py.
+car ACROSS videos/cameras (the journey key).
+
+Per-vehicle read state is passed IN by the caller (see new_read_state) rather
+than stashed on the tracker's vehicle dict, which is what lets the plate
+enricher's compute phase be pure and run off the main thread.
 """
 
 from collections import Counter
@@ -213,7 +216,17 @@ def _consensus(reads):
     return (voted, max(same) if same else best[1])
 
 
-def read_plate_tracked(crop_bgr, vehicle: dict):
+def new_read_state() -> dict:
+    """Fresh per-vehicle plate-read state, owned by the CALLER.
+
+    This used to live in the TrackStore's vehicle dict, which meant reading a
+    plate mutated shared tracker state - so plate reading could never run on a
+    worker thread. The state is the same; who owns it is the change.
+    """
+    return {"reads": [], "seen": 0}
+
+
+def read_plate_tracked(crop_bgr, state: dict):
     """Accumulate reads across a vehicle's frames and return the consensus.
 
     Why not just OCR the biggest, sharpest crop: measured on this clip, the
@@ -229,12 +242,13 @@ def read_plate_tracked(crop_bgr, vehicle: dict):
     found yet (the vehicle has entered but its plate is still clipped by the
     bottom edge - true for 3 of 5 vehicles here) costs no budget.
     """
-    reads = vehicle.setdefault("_plate_reads", [])
+    reads = state.setdefault("reads", [])
     if len(reads) >= _cfg["max_reads"]:
-        return vehicle["attrs"].get("plate_number", ""), \
-            vehicle["attrs"].get("plate_conf", 0.0)
-    seen = vehicle.get("_plate_seen", 0) + 1
-    vehicle["_plate_seen"] = seen
+        # Budget spent. _consensus is deterministic over `reads`, which can no
+        # longer change, so this is the same answer the last call gave.
+        return _consensus(reads)
+    seen = state.get("seen", 0) + 1
+    state["seen"] = seen
     if (seen - 1) % _cfg["read_every"]:
         return _consensus(reads)
     text, conf = read_plate(crop_bgr)

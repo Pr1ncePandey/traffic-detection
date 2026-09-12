@@ -32,6 +32,14 @@ from src.attributes import ocr_engines, plate_format  # noqa: E402
 from src.attributes.plate import configure, detect_plate_box, read_plate_image  # noqa: E402
 from src.config import load  # noqa: E402
 
+
+def _plate_cfg(cfg: dict) -> dict:
+    """The plate reader's block, at its one canonical path."""
+    plate = dict(((cfg or {}).get("perception", {})
+                  .get("attributes", {}).get("plate", {})) or {})
+    plate.pop("enabled", None)      # a stage concern, not a reader knob
+    return plate
+
 GT_PATH = os.path.join("samples", "plate_gt.csv")
 # Plate crops live beside their labels, not in disposable outputs/, so the
 # fixture stays self-contained and re-runnable after outputs/ is wiped.
@@ -54,7 +62,7 @@ def parse_args():
 
 def make_gt(args, cfg):
     """Detect the plate inside each vehicle crop and save it for labelling."""
-    configure(**cfg.get("plate", {}))
+    configure(**_plate_cfg(cfg))
     os.makedirs(PLATE_DIR, exist_ok=True)
     os.makedirs(os.path.dirname(GT_PATH) or ".", exist_ok=True)
     crops = sorted(glob.glob(args.crops))
@@ -150,7 +158,7 @@ def main():
 
     wanted = ([b.strip() for b in args.backends.split(",")]
               if args.backends else list(ocr_engines.BACKENDS))
-    pcfg = cfg.get("plate", {})
+    pcfg = _plate_cfg(cfg)
 
     print(f"\n{len(samples)} labelled plate(s) from {args.gt}")
     print("NOTE: published accuracy figures for these backends come from "

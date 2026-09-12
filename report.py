@@ -6,7 +6,9 @@ Three things were wrong with the previous version and are fixed here:
    A_TO_B / B_TO_A, so every zone-counted run reported "IN: 0 | OUT: 0".
 2. It called distinct track IDs "unique vehicles". ByteTrack issues a NEW id
    to an object that leaves and re-enters, so that figure is an upper bound on
-   real vehicles, not a count of them. It is labelled honestly now.
+   real vehicles, not a count of them. It is labelled honestly now, and sits
+   next to the plate-keyed vehicle count, which is the real figure for every
+   vehicle whose plate was read.
 3. It built one HTML card per object with no limit, from a full CSV read. Over
    a long run that produces a document too large to open. Card count is capped
    (--limit) and the cap is stated in the output.
@@ -59,6 +61,22 @@ def main():
         "SELECT COUNT(*) n FROM objects WHERE lane_flag LIKE '%wrong%'").fetchone()["n"]
     plates = conn.execute(
         "SELECT COUNT(*) n FROM attributes WHERE key='plate_number'").fetchone()["n"]
+    # Counted over objects, not over the vehicles table: a plate whose voted
+    # consensus shifted mid-track can leave a vehicles row that no sighting
+    # ends up referencing, and counting rows would report a car that was never
+    # actually seen. DISTINCT over the FK is the number that cannot be wrong.
+    vehicles = conn.execute(
+        "SELECT COUNT(DISTINCT vehicle_id) n FROM objects"
+        " WHERE vehicle_id IS NOT NULL").fetchone()["n"]
+    # Sightings that resolved to a vehicle, and the re-entries among them: a
+    # vehicle with more than one objects row is precisely a car this system
+    # used to count twice.
+    linked = conn.execute(
+        "SELECT COUNT(*) n FROM objects WHERE vehicle_id IS NOT NULL").fetchone()["n"]
+    returning = conn.execute(
+        "SELECT COUNT(*) n FROM (SELECT vehicle_id FROM objects"
+        " WHERE vehicle_id IS NOT NULL GROUP BY vehicle_id"
+        " HAVING COUNT(*) > 1)").fetchone()["n"]
     events = conn.execute(
         "SELECT kind, COUNT(*) n FROM events GROUP BY kind ORDER BY n DESC").fetchall()
 
@@ -85,7 +103,7 @@ def main():
         cards.append(f'''<div class="card{' bad' if 'wrong' in flag else ''}">
   {img}
   <div class="meta">
-    <b>#{r["id"]}</b> track {r["track_id"]} &middot; {html.escape(r["cls_name"] or "?")}
+    <b>#{r["id"]}</b> {("V" + str(r["vehicle_id"])) if r["vehicle_id"] is not None else "track " + str(r["track_id"])} &middot; {html.escape(r["cls_name"] or "?")}
     <span class="grp">{html.escape(r["cls_group"] or "")}</span><br>
     seen {r["frames_seen"]}x, {(r["first_seen_s"] or 0):.1f}s &rarr; {(r["last_seen_s"] or 0):.1f}s<br>
     conf {(r["best_conf"] or 0):.2f} &middot; lane {html.escape(str(r["lane_id"] or "-"))}
@@ -127,8 +145,12 @@ def main():
  <tr><th>Camera</th><td>{html.escape(str(run["camera"] if run else ""))}</td></tr>
  <tr><th>Frames analysed</th><td>{frames_n}</td></tr>
  <tr><th>Distinct track IDs</th><td>{total_tracks}
-   <span class="note">upper bound on real objects &mdash; a re-entering object
-   gets a new ID</span></td></tr>
+   <span class="note">one per sighting &mdash; a re-entering object gets a new
+   ID, so this over-counts real objects</span></td></tr>
+ <tr><th>Distinct vehicles (by plate)</th><td>{vehicles}
+   <span class="note">{linked} sighting(s) resolved to a vehicle;
+   {returning} vehicle(s) were seen more than once. Vehicles with no readable
+   plate are not counted here.</span></td></tr>
  <tr><th>Total sightings</th><td>{totals["sightings"] or 0}</td></tr>
  <tr><th>A&rarr;B</th><td>{crossings.get("A_TO_B", 0)}</td></tr>
  <tr><th>B&rarr;A</th><td>{crossings.get("B_TO_A", 0)}</td></tr>
@@ -148,7 +170,7 @@ def main():
     conn.close()
     print(f"[report] {args.out} | {len(rows)} of {total_tracks} objects, "
           f"A->B={crossings.get('A_TO_B', 0)} B->A={crossings.get('B_TO_A', 0)}, "
-          f"plates={plates}")
+          f"plates={plates}, vehicles={vehicles} ({returning} seen more than once)")
 
 
 if __name__ == "__main__":

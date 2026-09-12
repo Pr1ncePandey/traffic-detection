@@ -137,7 +137,7 @@ def _finish_road(img_shape):
 
 
 def _snippet(width, height):
-    lines = ['lanes_mode: "explicit"']
+    lines = ['analyses:', '  lanes:', '    mode: "explicit"']
     if _divider is not None:
         pts = to_ratios(_divider.as_points(), width, height, 4)
         lines += ["divider:", f"  points: {pts}"]

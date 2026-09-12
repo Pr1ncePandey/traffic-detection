@@ -1,203 +1,26 @@
-# Traffic Tracking Prototype - all knobs in one place.
-# Your brother can swap models / thresholds here without touching code.
+# FLEET-WIDE DEFAULTS. Applies to every camera stream.
+#
+# Per-camera overrides live in cameras/<id>.yaml and are deep-merged on top of
+# this file - see src/config.py::load_for_camera. A camera may override any key
+# here EXCEPT the fleet-wide ones (storage.*, frames.format, frames.retention,
+# perception.model.name/device, analysis.*), which are rejected with a warning.
+#
+# Run one camera:  python main.py --camera demo
 
-model:
-  name: "yolov8n.pt"     # swap to yolov8s.pt / yolov8m.pt / custom.pt (heavy models run on GPU)
-  conf: 0.3              # min confidence 0-1. Lower = more boxes, more mistakes.
-  iou: 0.5               # merges overlapping boxes
-  imgsz: 640             # analysis size. Lower (480) = faster on CPU.
-  device: "cpu"          # "cpu" on your laptop, "cuda" / 0 on GPU
-  classes: null          # null = ALL 80 COCO classes ("anything on road").
-                         # Also accepts "vehicle" / "on_road" (a class group),
-                         # ["car","truck"] (names), or the old [2,3,5,7] (ids).
-                         # NOTE: COCO has no pothole/debris/cone/barrier class -
-                         # those are not misdetected, they are invisible.
-
-tracker:
-  name: "bytetrack.yaml" # Ultralytics tracker config (ByteTrack)
-  persist: true
+camera:
+  id: "demo"             # cameras/<id>.yaml, and the {camera_id} in output paths
+  name: "demo"           # what a human reads in the report
 
 video:
+  # A camera normally declares its own `source` in cameras/<id>.yaml, so its
+  # geometry cannot be paired with the wrong footage. --source overrides.
   source: "samples/input.mp4"
-  target: "outputs/annotated.mp4"
-  csv: "outputs/tracks.csv"
-  summary: "outputs/summary.txt"
+  target: "outputs/{camera_id}/annotated.mp4"
+  csv: "outputs/{camera_id}/tracks.csv"
+  summary: "outputs/{camera_id}/summary.txt"
+  write_video: true
 
-processing:
-  max_frames: -1         # -1 = all frames, else first N (quick test)
-  analyse_fps: null      # frames per second to ANALYSE, independent of the
-                         # source rate. null = every frame. 5 on a 30fps feed
-                         # analyses 5/sec and skips the rest.
-  frame_skip: 1          # DEPRECATED integer form of the above; translated on load.
-  evict_every: 150       # sweep retired tracks every N analysed frames
-
-counting_line:
-  enabled: true          # legacy single line; used only if camera block removed
-  y_ratio: 0.6           # ...kept for backward compat
-  color: [0, 255, 255]   # yellow (B,G,R)
-
-camera:                  # ONE file per CCTV in production (cameras/<name>.yaml)
-  name: "demo"           # this camera's view: vehicles flow bottom -> top
-  line_a_ratio: 0.35     # upper line (exit side, top)
-  line_b_ratio: 0.65     # lower line (entry side, bottom)
-  label_a: "bottom (entry)"
-  label_b: "top (exit)"
-  color_a: [255, 0, 0]
-  color_b: [0, 255, 255]
-
-# WRONG-SIDE DETECTION ------------------------------------------------------
-# This block USED to carry two polygons hand-tuned on samples/input.mp4, and
-# every other source silently inherited them. Run on Indian test footage
-# that divider cut through the middle of a single one-way carriageway: 2 of 90
-# vehicle tracks were reported wrong-way, both driving correctly. So the
-# default is now to MEASURE the geometry instead of asserting it.
-#
-#   auto      learn the lanes and the divider from motion during a warmup
-#             window. Nothing is invented: if only one direction of travel is
-#             observed, you get ONE carriageway with a known flow, not a
-#             made-up oncoming lane. This is the right setting for a clip you
-#             have not calibrated.
-#   explicit  use the `lanes:` block below, and CHECK it against motion during
-#             the same warmup window. A lane whose traffic demonstrably flows
-#             the other way is reported at startup - see lanes_rules.on_mismatch.
-#   off       no lane or wrong-way analysis.
-#
-# Per camera: python tools/calibrate.py --suggest-lanes --source <video> \
-#               --out cameras/<name>.yaml     (measured)
-#             python tools/draw_lanes.py --source <video>   (clicked by hand)
-# then: python main.py --camera <name>
-lanes_mode: "auto"
-
-# Used when lanes_mode is explicit. `flow` is a VECTOR and is preferred over
-# `direction` ("up"/"down"/"left"/"right"): a camera on a pole sees the road
-# running diagonally, and no cardinal name describes it. See cameras/demo.yaml.
-lanes: []
-
-# The coming/going boundary, as a LINE rather than as the shared edge of two
-# polygons. Optional; drawn across the whole frame when present so that a
-# divider in the wrong place is obvious at a glance.
-# divider:
-#   points: [[0.34, 0.0], [0.05, 1.0]]
-
-lanes_rules:
-  warmup_frames: 300      # frames spent MEASURING before any alert can fire.
-                          # Also what gives each track enough history for a
-                          # heading, so nothing can be flagged on frame 1.
-                          # Measured: 120 frames of Indian test footage
-                          # attributed only 4 tracks to the misconfigured
-                          # lane, which was too thin to call the mismatch;
-                          # 200 frames gave 8 tracks and called it clearly.
-                          # Longer = a better check, later first alert.
-  on_mismatch: "suppress" # a configured lane whose traffic demonstrably flows
-                          # the other way. What to do about THAT LANE:
-                          #   suppress = stop wrong-way checking on it, keep
-                          #              everything else running (default).
-                          #              Known-bad geometry produces no alert.
-                          #   flip     = trust the measurement, correct its
-                          #              flow to the observed direction
-                          #   warn     = say so loudly but alert anyway
-                          #   off      = disable lane analysis for the run
-  # --- the wrong-side rule -------------------------------------------------
-  history: 8              # samples of ground-point history behind a heading.
-                          # A single-frame difference is noise: measured, the
-                          # far half of these clips moves 1-2 px per frame.
-  min_travel_px: 6.0      # travel over the window before a heading is trusted:
-  min_travel_rel: 0.15    # max(min_travel_px, this * the object's box height).
-                          # The old gate was a flat 4 px per frame, which 96%
-                          # of far-object frames and 68% of near-object frames
-                          # never reached - it was blind where it mattered.
-  align_cos: 0.5          # cosine between travel and lane flow. Past -0.5 is
-                          # wrong-way, past +0.5 is with the flow, between is
-                          # sideways and gets NO verdict (a lane change must
-                          # not read as wrong-way).
-  edge_px: 2              # ignore a box within this many px of a frame edge:
-                          # its bottom-centre is not where the vehicle is.
-  max_gap_frames: 5       # a track the detector LOST and re-acquired is not
-                          # one observation. Measured on a full run of
-                          # Indian test footage: track 349 vanished for 26
-                          # frames and came back 218 px lower, which the
-                          # velocity window read as downward travel - the
-                          # run's only wrong-way alert, on a vehicle driving
-                          # correctly. Position history older than this many
-                          # analysed frames is discarded, not differenced.
-  max_step_rel: 1.5       # and within a small gap: one step longer than this
-                          # many of the object's own heights is a detector
-                          # jump or an id switch, not motion. Real motion
-                          # peaks near 0.2 box-heights per frame.
-  divider_margin_rel: 0.35    # keep-out band around the divider and the lane
-  divider_margin_min_px: 6.0  # boundary, as a fraction of the object's own
-  lane_margin_rel: 0.15       # height. Replaces a flat 14 px, which was
-  lane_margin_min_px: 4.0     # metres of road at the top of the frame.
-  confirm_window: 8       # confirm wrong-way on `confirm_count` opposing
-  confirm_count: 5        # samples out of the last `confirm_window` - NOT
-                          # consecutive. A vehicle crawling the wrong way down
-                          # a jammed road kept resetting the old streak.
-  # --- how the warmup survey decides what it saw ---------------------------
-  survey_min_samples: 6       # frames a track needs before it votes
-  survey_min_travel_px: 25.0  # and how far it must have travelled
-  survey_min_travel_rel: 0.5  # (or this much of its own box height)
-  opposing_min_tracks: 3      # a second carriageway is only believed with at
-  opposing_min_frac: 0.12     # least this many / this fraction of tracks
-                              # going the other way. Below it: one carriageway.
-
-analysis:                # how the analyses are scheduled, not what they do
-  parallel: false        # run the compute phase of concurrent-safe analyzers
-                         # on worker threads. Off by default: the wrong-side
-                         # rule is a few dozen float ops per object and costs
-                         # more to dispatch than it saves. Worth turning on
-                         # once a heavy analysis (anpr, congestion) is staged.
-  workers: null          # null = one per concurrent analyzer
-
-# Frame and object-image settings now live in the `frames:` and `objects:`
-# blocks at the bottom of this file. Every analysed frame is stored raw AND
-# annotated - there is no longer an every-Nth-frame setting.
-
-attributes:
-  enabled: ["type"]      # plate OCR is enabled via the `analyzers:` list
-                         # ("anpr"); this block is kept for compatibility and
-                         # is reconciled with it on load.
-
-plate:                   # number-plate reader (CPU: YOLO finds the box, an OCR backend reads it)
-  det_conf: 0.3          # plate-box threshold. Lower = more boxes, more junk OCR.
-  min_conf: 0.5          # OCR text below this is rejected as unreadable.
-  det_imgsz: 480         # detector size. Lower = faster, misses small plates.
-
-  # WHICH READER TO USE. Compare them yourself: python tools/bench_ocr.py
-  #   paddle_anpr - DEFAULT. Trained on Indian plates, two-row (bike) plates
-  #                 included. Needs the extra install in the README; without it
-  #                 plate reading is empty and says so, nothing else breaks.
-  #   fast_plate  - plate-specific, tiny and fastest. Nothing extra to download.
-  #   rapidocr    - generic text reader, not plate-specific. Fallback only:
-  #                 measured far the weakest.
-  # Character error rate on samples/plate_gt.csv (5 plates, lower is better):
-  #   paddle_anpr 0.19  |  fast_plate 0.54  |  rapidocr 0.88
-  ocr_backend: "paddle_anpr"
-  ocr_model: ""          # backend-specific model name. "" = that backend's default.
-                         #   fast_plate: cct-s-v2-global-model (default) or
-                         #               cct-xs-v2-global-model (smaller/faster)
-  # HOW MANY FRAMES TO READ PER VEHICLE. The plate is biggest the moment it
-  # clears the bottom of the frame, but that is also its most slanted, most
-  # motion-blurred view - measured here, the reading is most reliable ~10
-  # frames later on a slightly smaller plate. So sample a few frames across
-  # the vehicle instead of trusting the biggest crop. Frames where the plate
-  # is still cut off by the bottom edge cost nothing.
-  read_every: 3            # OCR every 3rd frame in which the plate is readable
-  max_reads: 8             # ...up to this many per vehicle (CPU budget)
-  vote: true               # combine the reads character-by-character. The same
-                           # plate reads differently frame to frame, and the
-                           # errors move around, so the majority is usually right.
-  vote_min_conf: 0.8       # only confident reads get a vote. Voting over every
-                           # frame is WORSE than not voting: distant views are junk.
-
-  format_correction: true  # fix OCR mix-ups using the Indian plate format (MH12AB1234).
-                         # Indian plates never use I or O in the letter part - too close
-                         # to 1 and 0 - so a "0" where a letter belongs is almost
-                         # certainly a D. Fixes at most ONE character; a plate fitting no
-                         # known format is left exactly as read, never guessed at.
-  join_rows: true          # two-row (bike) plates: read BOTH rows and join them.
-                           # false = old behaviour, loudest row only, loses a row.
-
-source:                  # only used for live sources (rtsp:// / http:// / webcam index)
+source:                  # live sources only (rtsp:// / http:// / webcam index)
   reconnect: true        # RTSP drops routinely; reconnect with backoff
   max_retries: 0         # 0 = retry forever
   backpressure: null     # null = auto (drop_oldest for live, buffer_all for files)
@@ -205,23 +28,223 @@ source:                  # only used for live sources (rtsp:// / http:// / webca
                          #   buffer_all  = lose nothing, latency may grow
   queue_size: null
 
-analyzers: ["counting", "lanes", "anpr", "color"]   # add "congestion" to enable it - no code change
+processing:
+  max_frames: -1         # -1 = all frames, else first N (quick test)
+  analyse_fps: null      # frames per second to ANALYSE, independent of the
+                         # source rate. null = every frame. 5 on a 30fps feed
+                         # analyses 5/sec and skips the rest.
+  evict_every: 150       # sweep retired tracks every N analysed frames
+
+# ===========================================================================
+# PERCEPTION - the common stage. Detect -> track -> attributes, once per frame.
+# Everything below produces the objects that EVERY analysis then reads, so an
+# analysis can filter on an attribute (trucks only, red vehicles only).
+# ===========================================================================
+perception:
+  model:
+    name: "yolov8n.pt"   # swap to yolov8s.pt / yolov8m.pt / custom.pt (heavy: GPU)
+    conf: 0.3            # min confidence 0-1. Lower = more boxes, more mistakes.
+    iou: 0.5             # merges overlapping boxes
+    imgsz: 640           # analysis size. Lower (480) = faster on CPU.
+    device: "cpu"        # "cpu" on a laptop, "cuda" / 0 on GPU
+    classes: null        # null = ALL 80 COCO classes ("anything on road").
+                         # Also accepts "vehicle" / "on_road" (a class group),
+                         # ["car","truck"] (names), or the old [2,3,5,7] (ids).
+                         # NOTE: COCO has no pothole/debris/cone/barrier class -
+                         # those are not misdetected, they are invisible.
+
+  tracker:
+    name: "bytetrack.yaml"
+    persist: true
+    track_buffer: 30
+
+  # Attribute enrichers, in run order. These are NOT analyses: they add facts
+  # to tracked objects before any analysis runs. Turn one off per camera with
+  # enabled: false (e.g. a camera too far away for plates).
+  attributes:
+    color:
+      enabled: true      # vehicle paint (HSV), person shirt/trousers
+
+    plate:               # number plate: YOLO finds the box, an OCR backend reads it
+      enabled: true
+      det_conf: 0.3      # plate-box threshold. Lower = more boxes, more junk OCR.
+      min_conf: 0.5      # OCR text below this is rejected as unreadable.
+      det_imgsz: 480     # detector size. Lower = faster, misses small plates.
+
+      # WHICH READER. Compare them yourself: python tools/bench_ocr.py
+      #   paddle_anpr - DEFAULT. Trained on Indian plates, two-row (bike)
+      #                 plates included. Needs the extra install in the README;
+      #                 without it plate reading is empty and says so.
+      #   fast_plate  - plate-specific, tiny and fastest. Nothing to download.
+      #   rapidocr    - generic text reader. Fallback only; far the weakest.
+      # Character error rate on samples/plate_gt.csv (5 plates, lower better):
+      #   paddle_anpr 0.19  |  fast_plate 0.54  |  rapidocr 0.88
+      ocr_backend: "paddle_anpr"
+      ocr_model: ""      # backend-specific model name. "" = that backend's default.
+
+      # HOW MANY FRAMES TO READ PER VEHICLE. The plate is biggest the moment it
+      # clears the bottom of the frame, but that is also its most slanted and
+      # most motion-blurred view - measured here the reading is most reliable
+      # ~10 frames later on a slightly smaller plate. So sample across the
+      # vehicle instead of trusting the biggest crop.
+      read_every: 3      # OCR every 3rd frame in which the plate is readable
+      max_reads: 8       # ...up to this many per vehicle (CPU budget)
+      vote: true         # combine reads character-by-character: the same plate
+                         # reads differently frame to frame and the errors move
+                         # around, so the majority is usually right.
+      vote_min_conf: 0.8 # only confident reads vote. Voting over every frame is
+                         # WORSE than not voting: distant views are junk.
+      format_correction: true  # fix OCR mix-ups using the Indian plate format
+                         # (MH12AB1234). Indian plates never use I or O in the
+                         # letter part - too close to 1 and 0 - so a "0" where a
+                         # letter belongs is almost certainly a D. Fixes at most
+                         # ONE character; a plate fitting no known format is
+                         # left exactly as read, never guessed at.
+      join_rows: true    # two-row (bike) plates: read BOTH rows and join them.
+
+# ===========================================================================
+# ANALYSES - independent consumers of the objects perception produced.
+# Each has its own `enabled`, so a camera can switch one off without touching
+# the others. Congestion, wrong-way and counting do not know about each other.
+# ===========================================================================
+analyses:
+  counting:
+    enabled: true
+    vehicles_only: true  # count vehicles only, not people/animals
+    zones:               # two lines: A (entry side) and B (exit side)
+      enabled: true
+      line_a_ratio: 0.35 # upper line (exit side, top)
+      line_b_ratio: 0.65 # lower line (entry side, bottom)
+      label_a: "bottom (entry)"
+      label_b: "top (exit)"
+      color_a: [255, 0, 0]
+      color_b: [0, 255, 255]
+
+  # WRONG-SIDE DETECTION ----------------------------------------------------
+  # This used to carry two polygons hand-tuned on samples/input.mp4, and every
+  # other source silently inherited them. On Indian test footage that divider
+  # cut through the middle of a single one-way carriageway: 2 of 90 vehicle
+  # tracks were reported wrong-way, both driving correctly. So the default is
+  # to MEASURE the geometry rather than assert it.
+  lanes:
+    enabled: true
+    mode: "auto"
+    #   auto     learn the lanes and divider from motion during a warmup
+    #            window. Nothing is invented: if only one direction of travel
+    #            is observed you get ONE carriageway with a known flow, not a
+    #            made-up oncoming lane. Right for an uncalibrated clip.
+    #   explicit use the `lanes:` list below and CHECK it against motion during
+    #            the same window. A lane whose traffic demonstrably flows the
+    #            other way is reported at startup - see rules.on_mismatch.
+    #   off      no lane or wrong-way analysis.
+    #
+    # Per camera: python tools/calibrate.py --suggest-lanes --source <video> \
+    #               --out cameras/<id>.yaml          (measured)
+    #             python tools/draw_lanes.py --source <video>   (by hand)
+    units: "auto"        # ratio | pixel | auto (per-lane override too)
+    lanes: []            # used when mode is explicit. `flow` is a VECTOR and is
+                         # preferred over `direction` ("up"/"down"): a camera on
+                         # a pole sees the road running diagonally and no
+                         # cardinal name describes it. See cameras/demo.yaml.
+    divider: null        # the coming/going boundary as a LINE, not the shared
+                         # edge of two polygons. Drawn across the whole frame
+                         # when present, so a divider in the wrong place is
+                         # obvious at a glance.
+                         #   divider: {points: [[0.34, 0.0], [0.05, 1.0]]}
+    rules:
+      warmup_frames: 300      # frames spent MEASURING before any alert can
+                              # fire. Also what gives each track enough history
+                              # for a heading, so nothing is flagged on frame 1.
+                              # Measured: 120 frames of Indian test footage
+                              # attributed only 4 tracks to the misconfigured
+                              # lane - too thin to call the mismatch; 200 frames
+                              # gave 8 tracks and called it clearly.
+      on_mismatch: "suppress" # a configured lane whose traffic demonstrably
+                              # flows the other way. What to do about THAT LANE:
+                              #   suppress = stop wrong-way checking on it, keep
+                              #              everything else running (default)
+                              #   flip     = trust the measurement, correct its
+                              #              flow to the observed direction
+                              #   warn     = say so loudly but alert anyway
+                              #   off      = disable lane analysis for the run
+      # --- the wrong-side rule ---------------------------------------------
+      history: 8              # samples of ground-point history behind a
+                              # heading. A single-frame difference is noise:
+                              # the far half of these clips moves 1-2 px/frame.
+      min_travel_px: 6.0      # travel over the window before a heading is
+      min_travel_rel: 0.15    # trusted: max(min_travel_px, this * box height).
+                              # The old gate was a flat 4 px per frame, which
+                              # 96% of far-object frames and 68% of near-object
+                              # frames never reached - blind where it mattered.
+      align_cos: 0.5          # cosine between travel and lane flow. Past -0.5
+                              # is wrong-way, past +0.5 is with the flow,
+                              # between is sideways and gets NO verdict (a lane
+                              # change must not read as wrong-way).
+      edge_px: 2              # ignore a box within this many px of a frame
+                              # edge: its bottom-centre is not where it is.
+      max_gap_frames: 5       # a track the detector LOST and re-acquired is
+                              # not one observation. Measured on a full run:
+                              # track 349 vanished for 26 frames and came back
+                              # 218 px lower, which the velocity window read as
+                              # downward travel - the run's only wrong-way
+                              # alert, on a vehicle driving correctly.
+      max_step_rel: 1.5       # within a small gap: one step longer than this
+                              # many of the object's own heights is a detector
+                              # jump or an id switch, not motion. Real motion
+                              # peaks near 0.2 box-heights per frame.
+      divider_margin_rel: 0.35    # keep-out band around the divider and the
+      divider_margin_min_px: 6.0  # lane boundary, as a fraction of the
+      lane_margin_rel: 0.15       # object's own height. Replaces a flat 14 px,
+      lane_margin_min_px: 4.0     # which was metres of road at frame top.
+      confirm_window: 8       # confirm wrong-way on `confirm_count` opposing
+      confirm_count: 5        # samples out of the last `confirm_window` - NOT
+                              # consecutive. A vehicle crawling the wrong way
+                              # down a jammed road kept resetting the old streak.
+      # --- how the warmup survey decides what it saw ------------------------
+      survey_min_samples: 6       # frames a track needs before it votes
+      survey_min_travel_px: 25.0  # and how far it must have travelled
+      survey_min_travel_rel: 0.5  # (or this much of its own box height)
+      opposing_min_tracks: 3      # a second carriageway is only believed with
+      opposing_min_frac: 0.12     # at least this many / this fraction of tracks
+                                  # going the other way. Below it: one carriageway.
+
+  congestion:
+    enabled: false       # set true per camera, or here for the whole fleet
+    busy_count: 6
+    heavy_count: 12
+    jam_occupancy: 0.28
+    slow_px_per_frame: 2.0
+    min_frames: 15       # a level must PERSIST this long before it is reported,
+                         # so one noisy frame does not raise an alert
+    draw: true
+
+# ===========================================================================
+# INFRASTRUCTURE - fleet-wide. A camera file cannot override these.
+# ===========================================================================
+analysis:                # how the stages are SCHEDULED, not what they do
+  parallel: false        # run the compute phase of concurrent-safe plugins on
+                         # worker threads. The win is in perception: plate OCR
+                         # is tens of ms of ONNX per frame. The three analyses
+                         # are a few dozen float ops each and barely benefit.
+  workers: null          # null = one per concurrent plugin
 
 storage:
   backend: "sqlite"
-  path: "outputs/traffic.db"
+  path: "outputs/traffic.db"   # SHARED by every camera, by design: durable
+                               # vehicle identity (reid) is keyed on the plate
+                               # and works across cameras pointed at one DB.
   batch_rows: 500        # commit after this many rows...
-  commit_interval: 2.0   # ...or this many seconds. Worst case loss on a hard kill.
-  csv_export: true       # keep writing outputs/tracks.csv alongside the DB
+  commit_interval: 2.0   # ...or this many seconds. Worst case loss on a kill.
+  csv_export: true       # keep writing the per-camera tracks.csv too
 
 frames:                  # EVERY analysed frame is stored raw AND annotated
   enabled: true
-  format: "jpeg"         # jpeg = one file per frame per variant (simple; right for a clip)
-                         # segments = rolling H.264, same every-frame guarantee
-                          # MEASURED on Indian test footage (1080p): 378 KB/frame
-                         # at q85 => ~2 TB/day raw+annotated at 30fps, vs ~130 GB/day
-                         # as segments. Switch before using a permanent stream.
-  dir: "outputs/frames"
+  format: "jpeg"         # jpeg     = one file per frame per variant (right for a clip)
+                         # segments = rolling H.264, same every-frame guarantee.
+                         # MEASURED at 1080p: 378 KB/frame at q85 => ~2 TB/day
+                         # raw+annotated at 30fps, vs ~130 GB/day as segments.
+                         # Switch before pointing this at a permanent stream.
+  dir: "outputs/{camera_id}/frames"
   quality: 85
   encode_workers: 3
   segment_seconds: 300
@@ -233,12 +256,33 @@ frames:                  # EVERY analysed frame is stored raw AND annotated
 objects:                 # one image per detected object
   save_crops: true
   crop_min_conf: 0.5
-  crop_dir: "outputs/crops"
+  crop_dir: "outputs/{camera_id}/crops"
 
-congestion:
-  busy_count: 6
-  heavy_count: 12
-  jam_occupancy: 0.28
-  slow_px_per_frame: 2.0
-  min_frames: 15
-  draw: true
+reid:                    # DURABLE IDENTITY - the same car keeps one id
+  # ByteTrack matches on motion and box overlap only. It holds a lost track for
+  # ~1s then deletes it, so a vehicle that leaves the frame and comes back gets
+  # a NEW track id and is counted as a new object. The number plate is the only
+  # identity that survives an absence, so it is the key: plate -> a stable
+  # vehicle id, kept in the `vehicles` table and reused across runs AND across
+  # cameras pointed at the same DB.
+  #
+  # Track id still means "one sighting" and every sighting still gets its own
+  # objects row, so counting is unaffected. objects.vehicle_id ties them together.
+  enabled: true
+  min_conf: 0.7          # plate confidence needed to key an identity on.
+                         # Higher than plate.min_conf (0.5) on purpose: a read
+                         # good enough to PRINT on a box is not good enough to
+                         # merge two vehicles' histories on. A wrong caption is
+                         # one bad frame; a wrong merge is permanent.
+  require_format: true   # only bind plates that cleanly fit a real Indian
+                         # registration template. false falls back to the loose
+                         # "has letters and digits" check, which the 'IND' band
+                         # on an HSRP plate also passes.
+  fuzzy_distance: 0      # 0 = exact match only, and leave it there unless you
+                         # have measured otherwise. Real plates differ by one
+                         # character (...8337 and ...8338 are two cars), so
+                         # near-match merging fuses strangers rather than
+                         # repairing OCR noise.
+  cache_size: 4096       # plate -> id LRU. A miss costs one indexed lookup, so
+                         # this only has to cover the plates in flight; the cap
+                         # is what keeps a 24/7 feed's memory flat.

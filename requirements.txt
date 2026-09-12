@@ -7,15 +7,43 @@ numpy
 pyyaml
 
 # --- Number-plate OCR backends -------------------------------------------
-# Pick one with `plate.ocr_backend` in config.yaml. Vehicle counting works
-# with none of these installed; plate reading just stays empty.
+# Pick one with `plate.ocr_backend` in config.yaml (or --ocr-backend). Vehicle
+# counting works with none of these installed; plate reading just stays empty
+# and says so. Character error rate on samples/plate_gt.csv, lower is better
+# (n=5, so the ordering is solid and the values indicative):
 #
-# "rapidocr" (default, installed below): generic scene-text OCR, small, CPU.
-rapidocr-onnxruntime<2   # <2 matters: 2.x renamed the package and changed its return type
+#   paddle_anpr  CER 0.19   50ms   the DEFAULT - see the note at the bottom
+#   fast_plate   CER 0.54    8ms   installed below
+#   rapidocr     CER 0.88   370ms  installed below, fallback only
 #
-# "fast_plate": plate-specialised, small and fast. Installed below (~5MB model).
+# "fast_plate": plate-specialised CCT model, small and fast (~5MB ONNX).
 fast-plate-ocr[onnx]
 #
-# "paddle_anpr": PP-OCRv5 finetuned on Indian plates, best on two-row plates.
-#     Heaviest install (paddle wheel + ~150MB weights + a PaddleOCR clone).
-#     pip install paddlepaddle safetensors
+# "rapidocr": generic scene-text OCR, not plate-specialised. Fallback only.
+rapidocr-onnxruntime<2   # <2 matters: 2.x renamed the package and changed its return type
+#
+# ---------------------------------------------------------------------------
+# HEADS UP: the DEFAULT backend is NOT installed by this file.
+#
+# config.yaml, src/config.py and src/attributes/plate.py all default
+# plate.ocr_backend to "paddle_anpr", and it needs three things this file
+# cannot provide - a paddle wheel, ~150MB of weights, and a PaddleOCR source
+# checkout that ppocr is imported from. So `pip install -r requirements.txt`
+# alone leaves plate reading OFF, with:
+#
+#   [plate] paddle_anpr unavailable: PaddleOCR checkout not found.
+#
+# That is graceful - detection, tracking, counting, lanes and congestion all
+# still run - but no plates are read, which also means no plate-keyed vehicle
+# re-identification (see `reid:` in config.yaml). Either complete the install:
+#
+#   pip install paddlepaddle safetensors scikit-image
+#   mkdir -p models/anpr_ocr && cd models/anpr_ocr
+#   curl -LO https://huggingface.co/Awiros/anpr-ocr/resolve/main/model.safetensors
+#   curl -LO https://huggingface.co/Awiros/anpr-ocr/resolve/main/en_dict.txt
+#   cd ../.. && git clone --depth 1 \
+#       https://github.com/PaddlePaddle/PaddleOCR.git models/PaddleOCR
+#
+# ...or switch to a backend this file does install:
+#
+#   python main.py --ocr-backend fast_plate

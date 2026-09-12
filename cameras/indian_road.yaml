@@ -1,20 +1,27 @@
-# Measured by tools/calibrate.py from samples/indian_road.mp4 (300 frames) - confirm once per CCTV.
-camera:
-  name: "new_camera"
-  line_a_ratio: 0.35
-  line_b_ratio: 0.65
-  label_a: "top (entry)"
-  label_b: "bottom (exit)"
-  color_a: [255, 0, 0]
-  color_b: [0, 255, 255]
+# Measured by tools/calibrate.py from samples/indian_road.mp4 (300 frames).
+# Confirm the geometry once per CCTV before trusting wrong-way alerts from it.
 
-lanes_mode: "explicit"
-lanes:
-  - name: "carriageway"
-    polygon: [[0.2448, 1.0], [0.412, 0.1], [0.4354, 0.0398], [0.4536, 0.0009], [0.6156, 0.0], [0.6161, 0.0], [0.9005, 0.2815], [1.0, 0.4306], [1.0, 0.4426], [1.0, 0.6352], [0.9922, 1.0], [0.2792, 1.0]]
-    flow: [0.2501, 0.9682]
-    allowed: []
-  # ONE carriageway: only one direction of travel was
-  # observed, so no divider was invented. If a second
-  # road IS in view but was empty, add it by hand with
-  # tools/draw_lanes.py and give it the opposite flow.
+camera:
+  name: "indian_road"
+
+video:
+  source: "samples/indian_road.mp4"
+
+analyses:
+  counting:
+    zones:
+      line_a_ratio: 0.35
+      line_b_ratio: 0.65
+      label_a: "top (entry)"
+      label_b: "bottom (exit)"
+
+  lanes:
+    mode: "explicit"
+    lanes:
+      - name: "carriageway"
+        polygon: [[0.2448, 1.0], [0.412, 0.1], [0.4354, 0.0398], [0.4536, 0.0009], [0.6156, 0.0], [0.6161, 0.0], [0.9005, 0.2815], [1.0, 0.4306], [1.0, 0.4426], [1.0, 0.6352], [0.9922, 1.0], [0.2792, 1.0]]
+        flow: [0.2501, 0.9682]
+        allowed: []
+      # ONE carriageway: only one direction of travel was observed, so no
+      # divider was invented. If a second road IS in view but was empty, add it
+      # by hand with tools/draw_lanes.py and give it the opposite flow.

@@ -39,6 +39,12 @@ class TrackStore:
         self.wrong_way_ids = set()
         self.wrong_lane_ids = set()
         self.object_ids = {}        # tid -> storage object id (survives in the DB)
+        # Durable identity. vehicle_of is the answer to "is this the same car
+        # as before"; plate_of remembers which plate string produced it, so a
+        # consensus that changes as more frames are voted triggers a rebind
+        # instead of silently keeping the first guess. See trackers/identity.py.
+        self.vehicle_of = {}        # tid -> vehicle id (plate-keyed, cross-run)
+        self.plate_of = {}          # tid -> plate string that was bound
         self.evicted = 0           # tracks retired by evict_stale
         # Cumulative, incremented once per track on first sight. self.vehicles
         # cannot be used for totals because evict_stale removes from it.
@@ -155,6 +161,8 @@ class TrackStore:
             self.lane_of.pop(tid, None)
             self.lane_flag_of.pop(tid, None)
             self.object_ids.pop(tid, None)
+            self.vehicle_of.pop(tid, None)
+            self.plate_of.pop(tid, None)
             self.saved_crops.discard(tid)
             self._seen_below.discard(tid)
             self._seen_above.discard(tid)
@@ -173,6 +181,7 @@ class TrackStore:
         """Total tracked entries - used to assert memory really is bounded."""
         return (len(self.vehicles) + len(self.prev_y) + len(self.prev_xy)
                 + len(self.lane_of) + len(self.lane_flag_of) + len(self.object_ids)
+                + len(self.vehicle_of) + len(self.plate_of)
                 + len(self.saved_crops) + len(self._seen_below) + len(self._seen_above)
                 + len(self._counted) + len(self._lane_seen)
                 + len(self.wrong_way_ids) + len(self.wrong_lane_ids))

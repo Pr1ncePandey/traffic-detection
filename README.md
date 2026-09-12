@@ -8,6 +8,8 @@ object-level record to SQLite alongside every stored frame.
 
 - What passed through the view, of which type, and when?
 - Where did a specific object go, by track id or by number plate?
+- Is this the same vehicle that was here earlier, or yesterday, or on another
+  camera? (Plate-keyed, see Identity below.)
 - How many crossed in each direction, on which road, and was any going the wrong way?
 - How congested was the road, over time?
 
@@ -35,25 +37,63 @@ source (file | rtsp:// | webcam)
    table, every analysed frame stored raw *and* annotated, and one image per
    detected object.
 
-## Identity: what a track id does and does not mean
+## Identity: sightings vs vehicles
 
-**ByteTrack cannot re-assign a previous id to a reappearing object.** It matches
-on Kalman-predicted motion and IoU overlap only (`match_thresh: 0.8`) with no
-appearance model. A lost track is held for `track_buffer` frames (30 by default,
-so ~1s at 30fps) and then deleted; anything that returns after that — or that was
-occluded and moved meanwhile — gets a **fresh, higher id**. Ids are never recycled.
+There are **two** levels of identity, and the difference is the single most
+important thing to understand about the output.
 
-Consequences, and they are not cosmetic:
+| | what it is | scope | where |
+|---|---|---|---|
+| **track id** | one *sighting* | inside one run | `objects.track_id` |
+| **vehicle id** | one *car* | across runs **and cameras** | `vehicles.id`, referenced by `objects.vehicle_id` |
 
-- **"Distinct track IDs" is an upper bound on real objects, not a count of them.**
-  A car that leaves and re-enters is counted twice. The reports label this
-  honestly; earlier versions called it "unique vehicles", which was wrong.
-- **The number plate is the only durable identity.** It is stored once per object
-  in the `attributes` table, which is why `query.py --plate` searches across runs
-  and cameras while `--id` is scoped to one object row.
-- If short-occlusion recovery matters, `tracker.name: botsort.yaml` with
-  `with_reid: True` adds appearance re-association. It is a config change, not a
-  code change — but it still will not give identity across long absences.
+**Why two.** ByteTrack cannot re-assign a previous id to a reappearing object.
+It matches on Kalman-predicted motion and IoU overlap only (`match_thresh:
+0.8`) with no appearance model. A lost track is held for `track_buffer` frames
+(30 by default, ~1s at 30fps) and then deleted; anything that returns after
+that gets a **fresh, higher id**. Ids are never recycled.
+
+So the track id alone over-counts real vehicles. The number plate is the only
+identity this system reads that survives an absence, and it is now used as the
+key: `reid:` in `config.yaml` resolves a plate to a stable **vehicle id**, held
+in the `vehicles` table. A car that leaves and comes back gets its original
+vehicle id back — on the annotated video it is labelled `V7`, not a new `#31` —
+and so does the same car tomorrow, or on a different camera writing to the same
+database.
+
+**Each sighting still gets its own `objects` row.** That is deliberate: a
+vehicle that genuinely passes twice really did pass twice, so throughput
+counting (`A->B` / `B->A`) is unaffected by re-identification. `vehicle_id` is
+what ties the sightings together. How many times a car was seen is
+`SELECT COUNT(*) FROM objects WHERE vehicle_id = ?`.
+
+```bash
+python query.py --vehicle 7              # every sighting of one car
+python query.py --plate HR26DK8337       # same, found by plate
+```
+
+### The honest limits
+
+- **No readable plate means no durable identity.** Too far, occluded, night,
+  or a two-wheeler whose plate never resolves: `vehicle_id` stays `NULL` and
+  those sightings are not linked to each other. They are not guessed at. The
+  report counts them in "Distinct track IDs" and not in "Distinct vehicles".
+- **Binding is deliberately conservative.** A plate must clear
+  `reid.min_conf` (0.7, higher than the 0.5 needed merely to *display* a
+  plate) and, by default, fit a real registration template. A wrong caption
+  costs one bad frame; a wrong merge fuses two cars' histories permanently.
+- **Near-match merging is off** (`reid.fuzzy_distance: 0`). Real plates differ
+  by one character — `...8337` and `...8338` are two different cars — so
+  fuzzy matching fuses strangers rather than repairing OCR noise.
+- **Identity arrives a little after the vehicle does.** The plate is not
+  readable on a track's first frame; it takes a few reads plus a vote
+  (`plate.read_every`, `plate.max_reads`). The id is bound as soon as the
+  plate is confident and re-checked against the final voted plate when the
+  track retires, so the value stored in the database is the settled one.
+- For short-occlusion recovery *within* a run, `tracker.name: botsort.yaml`
+  with `with_reid: True` adds appearance re-association. That is a config
+  change, complementary to this — it keeps one track id alive across a brief
+  occlusion, where plate identity links separate sightings.
 
 ## Detecting anything on the road — and the honest limit
 
@@ -102,20 +142,31 @@ nothing depends on the process exiting cleanly.
 |---|---|---|
 | `runs` | run | source, geometry, analyse_fps, full config JSON |
 | `frames` | analysed frame | `raw_path` + `annotated_path`, or segment + offset |
-| `objects` | **tracked object** | class, group, first/last seen, best conf, crop path, lane |
+| `objects` | **one sighting** | class, group, first/last seen, best conf, crop path, lane, `vehicle_id` |
+| `vehicles` | **one car** | plate (UNIQUE), first/last seen across every run — the durable identity |
 | `detections` | object per frame | box, conf, crossing event, lane flag |
 | `attributes` | object + key | **tall**: `('plate_number', 'HR26AF7196', 0.94)` |
-| `events` | notable moment | crossing, wrong_way, plate_read, congestion |
+| `events` | notable moment | crossing, wrong_way, plate_read, vehicle_identified, congestion |
 
 `attributes` is deliberately tall rather than wide columns: adding colour, brand
 or speed later needs no migration, and the `(key, value)` index keeps plate
 lookup fast.
+
+`objects.vehicle_id` is what makes a re-entering car one car — see
+[Identity](#identity-sightings-vs-vehicles). It is `NULL` when no plate was
+read confidently. There is deliberately **no** sightings counter on `vehicles`:
+the count is `COUNT(*)` over `objects.vehicle_id`, which cannot drift from the
+rows it claims to count.
 
 ```sql
 -- what was detected, by group
 SELECT cls_group, cls_name, COUNT(*) FROM objects GROUP BY 1,2 ORDER BY 3 DESC;
 -- plates, best read per object
 SELECT object_id, value, conf FROM attributes WHERE key='plate_number';
+-- cars that left and came back: one vehicle, several sightings
+SELECT v.id, v.plate, COUNT(o.id) sightings
+  FROM vehicles v JOIN objects o ON o.vehicle_id=v.id
+  GROUP BY v.id HAVING COUNT(o.id) > 1 ORDER BY sightings DESC;
 -- an object with its frames
 SELECT f.frame_no, f.raw_path, d.conf FROM detections d
   JOIN frames f ON f.id=d.frame_id WHERE d.object_id=42 ORDER BY f.frame_no;
@@ -339,7 +390,7 @@ pixels on a front-on plate is the single biggest remaining win.
 
 | Path | Contents |
 |---|---|
-| `outputs/traffic.db` | **the record** — objects, detections, attributes, events, frames |
+| `outputs/traffic.db` | **the record** — objects, vehicles, detections, attributes, events, frames |
 | `outputs/frames/raw/` | every analysed frame, untouched |
 | `outputs/frames/annotated/` | every analysed frame, with boxes and overlays |
 | `outputs/crops/object_<id>.jpg` | one image per detected object |
@@ -358,6 +409,17 @@ pip install -r requirements.txt
 python main.py
 python report.py
 python query.py --list
+```
+
+That gives you detection, tracking, counting, lanes, colour and congestion.
+It does **not** give you plates: `plate.ocr_backend` defaults to `paddle_anpr`,
+which needs the extra setup below, so the run prints `[plate] paddle_anpr
+unavailable: PaddleOCR checkout not found` and reads no plates — and therefore
+does no plate-keyed re-identification either. For plates without that setup,
+use a backend `requirements.txt` does install:
+
+```bash
+python main.py --ocr-backend fast_plate     # CER 0.54 vs paddle_anpr's 0.19
 ```
 
 Windows (PowerShell), same idea — keep the venv **outside** the project folder
@@ -414,7 +476,9 @@ corners and the divider.
 ```
 src/runtime/     frame sources, FPS sampling, reader thread, FrameContext
 src/detectors/   YOLO wrapper + COCO class grouping
-src/trackers/    per-object memory with TTL eviction
+src/trackers/    per-object memory with TTL eviction:
+                   store.py            per-track state, counting, eviction
+                   identity.py         plate -> stable vehicle id (re-id)
 src/attributes/  plate OCR (and colour/brand stubs)
 src/analysis/    use cases + the registry and scheduler:
                    base.py             the Analyzer/StagedAnalyzer contract
@@ -432,12 +496,20 @@ src/pipeline.py  orchestrator (owns the loop, knows no individual use case)
 
 In scope now: file / RTSP / webcam input at a configurable analysis rate; all-COCO
 detection with grouping; tracking; two-zone counting; lane direction and
-wrong-way flags; number plates; congestion levels; object-level SQLite storage
+wrong-way flags; number plates; plate-keyed vehicle re-identification across
+re-entries, runs and cameras; congestion levels; object-level SQLite storage
 with every frame retained.
 
 Known limits, stated plainly:
 - COCO cannot name potholes, debris, cones or barriers (see above).
-- Track ids over-count real objects; the plate is the durable identity.
+- Track ids count sightings and over-count real objects; `vehicle_id`
+  (plate-keyed) is the durable identity, and is NULL when no plate was read.
+- Re-identification needs an EXACT plate match, so it is capped by OCR
+  accuracy, not by the matching logic. On the sample clips `paddle_anpr`
+  reaches CER 0.19 but exact-match 0/5, because the plates are only 21-115 px
+  wide - a one-character slip is a different vehicle by design. Bigger plates
+  in frame is the lever; `reid.fuzzy_distance` is not (it would merge
+  `...8337` with `...8338`, two real cars).
 - Wrong-side detection needs to SEE both directions to confirm a divider.
   Neither sample clip has oncoming traffic, so the two-way path is exercised
   only by `tools/test_lanes.py`, not by real footage.

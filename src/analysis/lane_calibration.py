@@ -22,7 +22,7 @@ HONESTY RULE
 If only one direction of travel is observed, there is no evidence of a
 divider, and this module says so instead of inventing one. Both sample clips
 are that case - `input.mp4` has 8 clear tracks, all moving up; `plate_test.mp4`
-has 28, all moving up. The old `lanes_mode: auto` split the frame in half and
+has 28, all moving up. The old auto mode split the frame in half and
 manufactured an oncoming lane out of nothing, which is where the false alerts
 came from. A single carriageway with a known flow direction is a complete,
 useful answer: it still detects a vehicle coming the other way.

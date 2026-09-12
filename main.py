@@ -1,25 +1,29 @@
-"""Thin entry point. All settings live in config.yaml; CLI flags override them.
+"""Thin entry point. Global settings live in config.yaml, per-camera settings
+in cameras/<id>.yaml, and CLI flags override both.
 
 Run:
-  python main.py
-  python main.py --source rtsp://cam/stream --analyse-fps 5
-  python main.py --source 0                       # webcam
-  python main.py --analyzers counting,lanes,anpr,congestion
+  python main.py --camera demo
+  python main.py --camera junction_7 --analyse-fps 5
+  python main.py --source rtsp://cam/stream --camera junction_7
+  python main.py --camera demo --enable congestion --disable anpr
 """
 
 import argparse
 import copy
-import os
 
-from src.config import load
+from src.config import load_for_camera
 from src.pipeline import run_pipeline
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Traffic detection (YOLO + ByteTrack)")
-    p.add_argument("--config", default="config.yaml")
+    p.add_argument("--config", default="config.yaml", help="fleet-wide defaults")
+    p.add_argument("--camera", default=None,
+                   help="camera id -> cameras/<id>.yaml (one file per CCTV). "
+                        "The camera normally declares its own source.")
     p.add_argument("--source", default=None,
-                   help="video file, rtsp:// or http:// URL, or a webcam index like 0")
+                   help="override the camera's source: video file, rtsp:// or "
+                        "http:// URL, or a webcam index like 0")
     p.add_argument("--target", default=None)
     p.add_argument("--csv", default=None)
     p.add_argument("--db", default=None, help="SQLite path (default outputs/traffic.db)")
@@ -33,9 +37,12 @@ def parse_args():
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--analyse-fps", type=float, default=None,
                    help="frames per second to analyse, independent of source rate")
-    p.add_argument("--frame-skip", type=int, default=None, help="deprecated; use --analyse-fps")
-    p.add_argument("--analyzers", default=None,
-                   help="comma list, in run order: counting,lanes,anpr,congestion")
+    p.add_argument("--enable", default=None,
+                   help="comma list of analyses to switch on for this run")
+    p.add_argument("--disable", default=None,
+                   help="comma list of analyses or attributes to switch off")
+    p.add_argument("--parallel", action="store_true",
+                   help="run concurrent-safe compute phases on worker threads")
     p.add_argument("--backpressure", default=None, choices=["drop_oldest", "buffer_all"],
                    help="live: drop stale frames (flat latency) or keep all (growing lag)")
     p.add_argument("--frames-format", default=None, choices=["jpeg", "segments"])
@@ -45,8 +52,9 @@ def parse_args():
     p.add_argument("--no-line", action="store_true", help="hide the counting zones")
     p.add_argument("--line-a", type=float, default=None, help="upper zone ratio, e.g. 0.35")
     p.add_argument("--line-b", type=float, default=None, help="lower zone ratio, e.g. 0.65")
-    p.add_argument("--camera", default=None,
-                   help="camera name -> cameras/<name>.yaml (one file per CCTV)")
+    p.add_argument("--no-reid", action="store_true",
+                   help="disable plate-keyed vehicle re-identification "
+                        "(a re-entering vehicle then gets a new id)")
     p.add_argument("--ocr-backend", default=None,
                    choices=["rapidocr", "fast_plate", "paddle_anpr"])
     p.add_argument("--ocr-model", default=None, help="backend-specific OCR model name")
@@ -64,85 +72,71 @@ def _classes(spec: str):
     return [int(x) if x.strip().isdigit() else x.strip() for x in text.split(",")]
 
 
-# Keys a cameras/<name>.yaml may override. Everything geometric belongs here:
-# the divider and the per-camera rule tuning are as much a property of one
-# CCTV as the lane polygons are, and leaving them out of this list is how a
-# camera file ends up half-applied.
-_CAMERA_KEYS = ("camera", "lanes", "lanes_mode", "lanes_units", "divider",
-                "lanes_rules", "counting_line")
+def _names(spec: str) -> list:
+    return [n.strip() for n in (spec or "").split(",") if n.strip()]
 
 
-def _apply_camera(cfg: dict, name: str):
-    """Overlay cameras/<name>.yaml onto cfg, using ONLY the keys it declares.
+def _toggle(cfg: dict, names: list, on: bool):
+    """Switch an analysis or an attribute enricher on/off for this run.
 
-    Read raw rather than through load(): load() fills in every default, so a
-    camera file that simply does not mention `lanes_mode` used to overwrite
-    the one in config.yaml with the default "auto". Absent must mean absent.
+    One flag covers both stages because from the operator's side "turn plates
+    off for this camera" is one intent, and which stage `plate` lives in is an
+    implementation detail they should not have to know.
     """
-    path = os.path.join("cameras", f"{name}.yaml")
-    if not os.path.exists(path):
-        print(f"[WARN] cameras/{name}.yaml not found, using config.yaml camera block")
-        return
-    try:
-        import yaml
-        with open(path, encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
-    except Exception as e:
-        print(f"[WARN] could not read cameras/{name}.yaml ({e}); "
-              f"using config.yaml camera block")
-        return
-    for key in _CAMERA_KEYS:
-        if key not in raw:
-            continue
-        value = raw[key]
-        if isinstance(value, dict) and isinstance(cfg.get(key), dict):
-            cfg[key] = {**cfg[key], **value}   # per-key, so partial files work
+    analyses = cfg.setdefault("analyses", {})
+    attributes = cfg.setdefault("perception", {}).setdefault("attributes", {})
+    for name in names:
+        if name in analyses:
+            analyses[name]["enabled"] = on
+        elif name in attributes:
+            attributes[name]["enabled"] = on
         else:
-            cfg[key] = value
-    cfg.setdefault("camera", {})["name"] = name
-    # Backpressure is a per-camera property: a stream wants drop_oldest.
-    bp = (raw.get("source") or {}).get("backpressure")
-    if bp:
-        cfg.setdefault("source", {})["backpressure"] = bp
-    applied = [k for k in _CAMERA_KEYS if k in raw]
-    print(f"[camera] {path}: applied {', '.join(applied) or 'nothing'}")
+            known = ", ".join(sorted(set(analyses) | set(attributes)))
+            print(f"[main] unknown analysis/attribute {name!r}; known: {known}")
 
 
 def main():
     args = parse_args()
-    cfg = copy.deepcopy(load(args.config))
+    # Camera first, CLI second: a flag typed at the prompt must beat the file.
+    # The old order applied the camera file AFTER the flags, so --source was
+    # silently discarded whenever --camera was also given.
+    cfg = copy.deepcopy(load_for_camera(args.camera, args.config))
+
+    model = cfg["perception"]["model"]
     if args.source: cfg["video"]["source"] = args.source
     if args.target: cfg["video"]["target"] = args.target
     if args.csv: cfg["video"]["csv"] = args.csv
     if args.db: cfg.setdefault("storage", {})["path"] = args.db
-    if args.model: cfg["model"]["name"] = args.model
-    if args.conf is not None: cfg["model"]["conf"] = args.conf
-    if args.iou is not None: cfg["model"]["iou"] = args.iou
-    if args.imgsz is not None: cfg["model"]["imgsz"] = args.imgsz
-    if args.device: cfg["model"]["device"] = args.device
-    if args.classes is not None: cfg["model"]["classes"] = _classes(args.classes)
+    if args.model: model["name"] = args.model
+    if args.conf is not None: model["conf"] = args.conf
+    if args.iou is not None: model["iou"] = args.iou
+    if args.imgsz is not None: model["imgsz"] = args.imgsz
+    if args.device: model["device"] = args.device
+    if args.classes is not None: model["classes"] = _classes(args.classes)
     if args.max_frames is not None: cfg["processing"]["max_frames"] = args.max_frames
     if args.analyse_fps is not None: cfg["processing"]["analyse_fps"] = args.analyse_fps
-    if args.frame_skip is not None: cfg["processing"]["frame_skip"] = args.frame_skip
-    if args.analyzers is not None:
-        cfg["analyzers"] = [a.strip() for a in args.analyzers.split(",") if a.strip()]
+    if args.parallel: cfg.setdefault("analysis", {})["parallel"] = True
+    if args.enable: _toggle(cfg, _names(args.enable), True)
+    if args.disable: _toggle(cfg, _names(args.disable), False)
     if args.backpressure: cfg.setdefault("source", {})["backpressure"] = args.backpressure
     if args.frames_format: cfg.setdefault("frames", {})["format"] = args.frames_format
     if args.no_frames: cfg.setdefault("frames", {})["enabled"] = False
     if args.max_disk_gb is not None:
-        cfg.setdefault("frames", {}).setdefault("retention", {})["max_disk_gb"] = args.max_disk_gb
+        cfg["frames"].setdefault("retention", {})["max_disk_gb"] = args.max_disk_gb
     if args.max_age_hours is not None:
-        cfg.setdefault("frames", {}).setdefault("retention", {})["max_age_hours"] = args.max_age_hours
-    if args.ocr_backend: cfg.setdefault("plate", {})["ocr_backend"] = args.ocr_backend
-    if args.ocr_model: cfg.setdefault("plate", {})["ocr_model"] = args.ocr_model
-    if args.no_line:
-        cfg.setdefault("counting_line", {})["enabled"] = False
-        cfg.setdefault("camera", {})["enabled"] = False
-    if args.line_a is not None: cfg.setdefault("camera", {})["line_a_ratio"] = args.line_a
-    if args.line_b is not None: cfg.setdefault("camera", {})["line_b_ratio"] = args.line_b
-    if args.camera:
-        _apply_camera(cfg, args.camera)
-    if args.lanes: cfg["lanes_mode"] = args.lanes
+        cfg["frames"].setdefault("retention", {})["max_age_hours"] = args.max_age_hours
+    if args.no_reid: cfg.setdefault("reid", {})["enabled"] = False
+
+    plate = cfg["perception"]["attributes"].setdefault("plate", {})
+    if args.ocr_backend: plate["ocr_backend"] = args.ocr_backend
+    if args.ocr_model: plate["ocr_model"] = args.ocr_model
+
+    zones = cfg["analyses"].setdefault("counting", {}).setdefault("zones", {})
+    if args.no_line: zones["enabled"] = False
+    if args.line_a is not None: zones["line_a_ratio"] = args.line_a
+    if args.line_b is not None: zones["line_b_ratio"] = args.line_b
+    if args.lanes: cfg["analyses"].setdefault("lanes", {})["mode"] = args.lanes
+
     run_pipeline(cfg)
     print("Next: python report.py | python query.py --list")
 

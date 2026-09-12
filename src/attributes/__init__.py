@@ -1,2 +1,3 @@
-"""Attribute plug-ins package. See base.py and color.py."""
-from .base import run_attributes  # noqa: F401
+"""Perception attributes: enrichers that add facts to tracked objects."""
+
+from .registry import build, register  # noqa: F401

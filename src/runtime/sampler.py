@@ -58,19 +58,13 @@ class FpsSampler:
 
 
 def from_config(cfg: dict, source_fps: float, is_live: bool) -> FpsSampler:
-    """Build from the `processing` block, honouring the deprecated frame_skip.
+    """Build from the `processing` block.
 
-    analyse_fps wins. frame_skip is still accepted so existing configs and
-    scripts keep working, translated into the fps it actually meant.
+    analyse_fps is the only spelling. The old integer `frame_skip` is gone: it
+    could express only 1/1, 1/2, 1/3... of the source rate and said nothing
+    about frames per second, and carrying both meant two ways to say one thing.
     """
     proc = cfg or {}
     target = proc.get("analyse_fps")
-    if target in (None, "", 0):
-        skip = int(proc.get("frame_skip", 1) or 1)
-        if skip > 1:
-            target = (source_fps or 30.0) / skip
-            print(f"[sampler] processing.frame_skip={skip} is deprecated; "
-                  f"treating it as analyse_fps={target:.2f}")
-        else:
-            target = None
-    return FpsSampler(source_fps, target, is_live=is_live)
+    return FpsSampler(source_fps, target if target not in ("", 0) else None,
+                      is_live=is_live)
