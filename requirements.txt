@@ -60,3 +60,22 @@ rapidocr-onnxruntime<2   # <2 matters: 2.x renamed the package and changed its r
 # ...or switch to a backend this file does install:
 #
 #   python main.py --ocr-backend fast_plate
+
+# --- Person attributes ------------------------------------------------------
+# `person` enricher (PP-Human, on by default) needs only onnxruntime, which
+# the OCR backends above already pull in. Fetch its model once:
+#   python tools/fetch_person_attr.py
+#
+# EXPERIMENTAL, off by default: `garments` (SegFormer-B2 clothes, MIT) and
+# `age_gender` (MiVOLO v2, Apache-2.0, body only). Heavy - roughly 0.5 s and
+# 1.5 s per person on a laptop CPU - so they are opt-in. Uncomment to use,
+# then run: python tools/fetch_person_models.py
+#
+# Versions are pinned for MiVOLO: its model code needs transformers 4.51 and
+# an older timm (see src/attributes/mivolo_loader.py for the shims). It is not
+# pip-installed; fetch_person_models.py clones it into models/MiVOLO.
+#
+# torch                  # already installed by ultralytics
+# transformers==4.51.0
+# timm==0.9.2
+# accelerate==1.8.1

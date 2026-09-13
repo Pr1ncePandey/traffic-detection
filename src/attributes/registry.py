@@ -63,6 +63,7 @@ def build(cfg: dict, source) -> list:
     start is skipped: a missing OCR backend must not stop vehicle counting.
     """
     _load_builtins()
+    _load_optional(enabled_names(cfg))
     built = []
     for name in enabled_names(cfg):
         factory = ENRICHERS.get(name)
@@ -99,3 +100,24 @@ def _load_builtins():
     except Exception as e:
         print(f"[perception] plate reader unavailable ({e}); "
               f"plate reading disabled")
+    try:
+        from .enrichers import person  # noqa: F401
+    except Exception as e:
+        print(f"[perception] person attributes unavailable ({e}); "
+              f"person attribute reading disabled")
+
+
+# Experimental, heavier person models. Imported only when a config switches
+# them on, so a machine without torch/transformers never pays for the import.
+OPTIONAL = ("garments", "age_gender")
+
+
+def _load_optional(names):
+    import importlib
+    for name in OPTIONAL:
+        if name not in names or name in ENRICHERS:
+            continue
+        try:
+            importlib.import_module(f"{__package__}.enrichers.{name}")
+        except Exception as e:
+            print(f"[perception] {name} unavailable ({e}); disabled")

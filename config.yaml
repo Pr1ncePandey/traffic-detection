@@ -134,6 +134,56 @@ perception:
                          # left exactly as read, never guessed at.
       join_rows: true    # two-row (bike) plates: read BOTH rows and join them.
 
+    person:              # people: which way they face, sleeves, trousers/shorts/
+      enabled: true      # skirt, bag, hat, glasses. One 7MB model (PP-Human
+                         # PPLCNet, Apache-2.0), whole-body crop - never the face.
+                         # Without the model it says so and everything else runs.
+                         # Fetch: python tools/fetch_person_attr.py
+      model: "models/person_attr/person_attr.onnx"
+
+      # WHAT IS STORED. Field test on 3 clips: facing + sleeves were right on
+      # all of them; lower/bag/hat/glasses only in good conditions (filter on
+      # <key>_conf). The model also decodes gender, age_group, long_coat,
+      # holding, upper_pattern, lower_pattern, boots - NOT stored by default
+      # because they were confidently wrong (women in headscarves read male
+      # at up to 0.97; elderly read 18-60; T-shirts read as long coats).
+      keys: [facing, sleeves, lower, bag, hat, glasses]
+
+      # WHICH CROPS ARE READ. A bad crop gives a confident wrong answer.
+      min_height: 80     # px. Smaller people are skipped: too few pixels to judge.
+      min_width: 30
+      edge_margin: 4     # skip people touching the frame edge (half a body)
+      min_det_conf: 0.35 # skip weak person detections (a road sign read as a person)
+      max_umbrella_cover: 0.25  # skip when an umbrella box hides >25% of the person
+
+      read_every: 3      # model every 3rd usable frame of a person...
+      max_reads: 8       # ...up to this many; the values are the AVERAGE of reads
+      min_reads: 3       # store nothing until a person has this many usable reads
+      thresholds:        # yes/no cut-offs per model label (default 0.5)
+        Glasses: 0.6     # PP-Human's own 0.3 let through mostly-wrong guesses
+      threads: 1         # onnxruntime threads per call (the stage is already pooled)
+
+    # EXPERIMENTAL, heavier person models - off until tested on Indian footage.
+    # Setup once: python tools/fetch_person_models.py
+    # Compare all three: python tools/eval_person_models.py --help
+    garments:            # SegFormer-B2 clothes parsing (MIT). Per pixel, so it
+      enabled: false     # tells a headscarf (scarf) from a hat, and skirt/dress/
+                         # trousers/shorts. ~0.6 s per read on 4 threads.
+      min_height: 120
+      read_every: 6
+      max_reads: 3
+      min_reads: 2
+      threads: 4
+
+    age_gender:          # MiVOLO v2 (Apache-2.0), BODY ONLY - no face used.
+      enabled: false     # Apparent age in years + gender. Needs torch,
+                         # transformers==4.51.0, timm==0.9.2.
+      min_height: 100
+      read_every: 6
+      max_reads: 3
+      min_reads: 2
+      threads: 4
+
 # ===========================================================================
 # ANALYSES - independent consumers of the objects perception produced.
 # Each has its own `enabled`, so a camera can switch one off without touching
