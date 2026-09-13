@@ -29,22 +29,6 @@ models/person_attr/
 .DS_Store
 Thumbs.db
 
-# LOCAL-ONLY tests (my machine): stay here, never pushed - the repo keeps
-# main system code only. tools/test_reid.py, test_lanes.py and test_stage.py
-# are the shared suites and ARE tracked.
-#
-#   test_congestion.py  congestion level/persistence rules
-#   test_incidents.py   incident policy: what fires, when, payload shape
-#   test_webhooks.py    delivery: real local receiver, signature, retry ladder
-#   test_api.py         the HTTP routes, in-process via TestClient
-#
-# The last three need the service extras (fastapi/uvicorn/httpx) and skip
-# cleanly without them. test_webhooks.py binds 127.0.0.1:9099 while it runs.
-tools/test_congestion.py
-tools/test_incidents.py
-tools/test_webhooks.py
-tools/test_api.py
-
 # Dummy webhook consumer: shows what the incident API sends. Local demo tool.
 tools/dummy_receiver.py
 
