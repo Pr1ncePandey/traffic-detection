@@ -29,9 +29,6 @@ models/person_attr/
 .DS_Store
 Thumbs.db
 
-# Dummy webhook consumer: shows what the incident API sends. Local demo tool.
-tools/dummy_receiver.py
-
 # SegFormer-B2 clothes (MIT) ONNX export and the MiVOLO source checkout
 # (Apache-2.0; imported for its model code, weights come from HuggingFace).
 models/clothes_seg/
