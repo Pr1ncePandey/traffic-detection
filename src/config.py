@@ -208,6 +208,41 @@ DEFAULTS = {
             "busy_count": 6, "heavy_count": 12, "jam_occupancy": 0.28,
             "slow_px_per_frame": 2.0, "min_frames": 15, "draw": True,
         },
+        # Human behaviour (analysis/behaviour.py): named zones and the rules
+        # that watch them - intrusion, loitering, crowding, running. No model:
+        # it reads the same tracks every other analysis does. OFF fleet-wide;
+        # a camera draws its own zones and switches it on. Polygons are ratios
+        # or pixels like lanes; a zone with no polygon is the whole frame.
+        # Per-zone rules: restricted, loitering_s, crowd_people (0/false = off).
+        # See docs/human-behaviour.md for why each threshold is what it is.
+        "behaviour": {
+            "enabled": False,
+            "groups": ["person"],
+            "units": "auto",
+            "zones": [],
+            # Polygons where a detected "person" is ignored by every rule: a
+            # sign pole or bollard the detector keeps mistaking for one.
+            "exclude": [],
+            "intrusion_s": 1.0,        # inside a restricted zone this long
+            "exit_grace_s": 2.0,       # outside this long before "left"
+            "crowd_hold_s": 5.0,       # crowd must hold before it is reported:
+            "crowd_fraction": 0.8,     # ...in this share of that window's frames
+            # Riders and passengers are not pedestrians. A two-wheeler covers
+            # ~half its rider (feet inside + 30%); a passenger is almost wholly
+            # inside a car/bus box (90%). 90% and not 30% for enclosed
+            # vehicles: a pedestrian behind a parked car is 30-60% covered.
+            "ignore_riders": True,
+            "rider_overlap": 0.3, "riders_in": ["bicycle", "motorcycle"],
+            "passenger_overlap": 0.9,
+            "passengers_in": ["car", "bus", "truck", "train"],
+            # Speed in BODY HEIGHTS PER SECOND, so it means the same near and
+            # far from the camera. Walking is ~0.8, jogging ~1.6, running 2+.
+            "running": {"enabled": True, "min_speed_hps": 1.6, "min_s": 1.0,
+                        "window_s": 1.0, "min_height_px": 40,
+                        "max_jump_hps": 6.0, "edge_px": 2},
+            "exit_events": True,
+            "draw": True,
+        },
     },
 
     # How the stages are SCHEDULED, not what they do. Host property, locked.
@@ -295,7 +330,12 @@ DEFAULTS = {
         # for EVERY vehicle, so it is a counter rather than an incident.
         "kinds": {"wrong_way": True, "congestion": True,
                   "wrong_lane": False, "crossing": False,
-                  "face_match": True},
+                  "face_match": True,
+                  # Behaviour (analysis/behaviour.py) fires AT DETECTION: the
+                  # analysis already held each rule for its own hold time.
+                  # running is off: children and joggers make it noisy.
+                  "intrusion": True, "loitering": True, "crowd": True,
+                  "running": False},
         # A recognised person fires AT CONFIRMATION, not at retirement: the
         # name is settled then, and "who just walked in" is worth nothing
         # five seconds late. The same person on the same camera again within

@@ -243,6 +243,12 @@ growth can be asserted in a long run — exactly what a service needs surfaced.
 | `wrong_lane` | configurable | Noisier; depends on lane confidence |
 | `crossing` | **no** | Every vehicle. It is a counter, not an incident |
 | `identity_bound` | no | Internal bookkeeping, fires on every rebind |
+| `face_match` | yes, at confirmation | See docs/face-recognition.md |
+| `intrusion` | yes, at detection | Person inside a `restricted` zone for `intrusion_s` (docs/human-behaviour.md) |
+| `loitering` | yes, at detection | Person inside a zone for its `loitering_s` |
+| `crowd` | yes, both edges | `crowd_people`+ in a zone, held `crowd_hold_s`; no subject, like congestion |
+| `running` | configurable, off | Noisy: children, joggers, people catching a bus |
+| `zone_exit` | **no** | Every person leaving a zone. Dwell data, not an incident |
 
 Per-kind enable flags in config, so this is policy rather than code.
 

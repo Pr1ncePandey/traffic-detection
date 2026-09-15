@@ -66,10 +66,17 @@ NEVER = {
     "person_read": "an attribute enricher reporting a fact",
     "face_unmatched": "a correction to an earlier face match - kept as an event, "
                       "because a retraction webhook nobody asked for is noise",
+    "zone_exit": "fires for every person leaving a zone - dwell data, not an incident",
 }
 
 DEFAULT_KINDS = {"wrong_way": True, "congestion": True,
-                 "wrong_lane": False, "crossing": False, "face_match": True}
+                 "wrong_lane": False, "crossing": False, "face_match": True,
+                 "intrusion": True, "loitering": True, "crowd": True,
+                 "running": False}
+
+# analysis/behaviour.py. intrusion/loitering/running are about one tracked
+# person; crowd is about a zone, so it has no subject, like congestion.
+BEHAVIOUR_KINDS = ("intrusion", "loitering", "running", "crowd")
 
 # Kept out of the payload's `detail` block: either projected into a dedicated
 # block already, or a local path a remote consumer cannot use.
@@ -79,6 +86,8 @@ _DETAIL_STRIP = frozenset({
     "first_seen_s", "last_seen_s", "frames_seen", "crop_path",
     # face_match: projected into the `person` block, or a local file path.
     "person", "score", "votes", "reads", "snapshot_path",
+    # behaviour: projected into the `subject` block.
+    "group",
 })
 
 CONGESTED = "congested"
@@ -239,6 +248,8 @@ class IncidentPolicy:
             return self._on_retire(event, ctx)
         if kind == "face_match":
             return self._on_face(event, ctx)
+        if kind in BEHAVIOUR_KINDS:
+            return self._on_behaviour(event, ctx)
         if self.is_incident(kind):
             return self._on_flag(event, ctx, kind, camera)
         return []
@@ -394,6 +405,36 @@ class IncidentPolicy:
         return [self._raise("face_match", camera, object_id, None, payload,
                             created_at=time.time())]
 
+    def _on_behaviour(self, event, ctx) -> list:
+        """A behaviour rule fired (analysis/behaviour.py): raise it NOW.
+
+        Not at retirement like wrong_way: "someone is on the tracks" is worth
+        nothing once they have left. And no dwell here like congestion: the
+        analysis already held each rule (intrusion_s, loitering_s,
+        crowd_hold_s) and emits each one once per track and zone, so a second
+        gate would only add latency. A repeat of the same object in the same
+        zone gets the same incident id, which storage ignores.
+        """
+        kind = event.get("kind")
+        if not self.is_incident(kind):
+            return []
+        camera = ctx.get("camera") or ""
+        detail = dict(event.get("detail") or {})
+        now = float(event.get("ts") or ctx.get("timestamp") or 0.0)
+        if kind == "crowd":
+            payload = self._payload(kind, camera, None, None, evidence=detail,
+                                    sighting={}, detected_at=now,
+                                    state=str(detail.get("state") or "crowded"),
+                                    dwell_s=detail.get("held_s"))
+            return [self._raise(kind, camera, None, None, payload,
+                                created_at=now)]
+        object_id = ctx.get("object_id")
+        payload = self._payload(kind, camera, object_id, None, evidence=detail,
+                                sighting=detail, detected_at=now,
+                                state="ongoing", dwell_s=detail.get("dwell_s"))
+        return [self._raise(kind, camera, object_id, None, payload,
+                            created_at=time.time())]
+
     def congestion_state(self, camera: str) -> str:
         return (self._congestion.get(camera) or {}).get("published", CLEAR)
 
@@ -418,6 +459,14 @@ class IncidentPolicy:
             # A tracker swap can put a SECOND name on one object; each name is
             # its own incident, so the id carries the person too.
             id_tail = f"{object_id}-{_slug((sighting or {}).get('person'))}"
+        elif kind == "crowd":
+            # One zone, one transition: the zone plus when the new state began.
+            ev = evidence or {}
+            id_tail = (f"{_slug(ev.get('zone'))}-"
+                       f"t{int(float(ev.get('since') or detected_at or 0))}")
+        elif kind in BEHAVIOUR_KINDS and object_id is not None:
+            zone = (evidence or {}).get("zone")
+            id_tail = f"{object_id}-{_slug(zone)}" if zone else object_id
         body = {
             "incident_id": incident_id(camera, kind, id_tail, detected_at),
             "kind": kind,
@@ -449,6 +498,20 @@ class IncidentPolicy:
                 if self.base_url and object_id is not None
                 and sighting.get("snapshot_path")
                 else None)
+        elif kind in BEHAVIOUR_KINDS:
+            body["zone"] = (evidence or {}).get("zone")
+            if kind != "crowd":
+                # A person subject with no identity: behaviour is about what
+                # someone does, never who they are. Nothing here names anyone.
+                sighting = sighting or {}
+                body["subject"] = {"group": sighting.get("group"),
+                                   "cls": sighting.get("cls_name") or None}
+                body["sighting"] = {"object_id": object_id}
+                # The crop row is written when the track retires, so this URL
+                # can 404 while the person is still in view; retry later.
+                body["image_url"] = (
+                    f"{self.base_url}/crops/{object_id}.jpg"
+                    if self.base_url and object_id is not None else None)
         elif kind != "congestion":
             sighting = sighting or {}
             # Block still named `vehicle`: it carries plate/colour/cls, and

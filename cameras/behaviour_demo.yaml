@@ -1,0 +1,61 @@
+# HUMAN BEHAVIOUR DEMO. The rainy pedestrian street (samples/short/person_test.mp4)
+# with three zones drawn by eye on a 10% grid of the frame at 10 s:
+#
+#   road       the carriageway. restricted: a person standing or walking on it
+#              is an intrusion (jaywalking). Riders and passengers are ignored.
+#   shopfront  under the awning, where people stand. Loitering after 20 s -
+#              deliberately short so a 63 s clip can show it; a real camera
+#              would use minutes.
+#   pavement   the paved walkway. A crowd when 5+ people hold on it for 5 s.
+#
+# Plate, colour and person attributes are off: nothing here needs them, and
+# they would only slow the demo down.
+
+camera:
+  name: "behaviour_demo"
+
+video:
+  source: "samples/short/person_test.mp4"
+
+analyses:
+  counting:
+    enabled: false
+  lanes:
+    enabled: false
+  congestion:
+    enabled: false
+  behaviour:
+    enabled: true
+    # Two fixed objects YOLO keeps calling "person" (up to 0.61 confidence,
+    # as high as real people here), found by the first run's contact sheet:
+    # the no-parking sign pole on the left median and the blue arrow bollard.
+    exclude:
+      - [[0.02, 0.32], [0.08, 0.32], [0.08, 0.39], [0.02, 0.39]]
+      - [[0.51, 0.20], [0.53, 0.20], [0.53, 0.245], [0.51, 0.245]]
+    zones:
+      - name: "road"
+        # Upper-left edge follows the market stalls' kerb. The first version
+        # ran straight across to the frame edge at y 0.22 and took in the
+        # stall frontage: 6 of 30 intrusions were shoppers at the stalls.
+        polygon: [[0.0, 0.45], [0.17, 0.33], [0.26, 0.198], [0.72, 0.16],
+                  [0.72, 0.24], [0.48, 0.40], [0.22, 0.50], [0.0, 0.56]]
+        restricted: true
+      - name: "shopfront"
+        polygon: [[0.74, 0.28], [0.93, 0.28], [0.93, 0.75], [0.80, 0.75]]
+        loitering_s: 20
+      - name: "pavement"
+        polygon: [[0.0, 0.56], [0.22, 0.50], [0.48, 0.40], [0.72, 0.24],
+                  [0.80, 0.75], [0.60, 1.0], [0.0, 1.0]]
+        # A DEMO threshold, like loitering_s above. At 5 this pavement never
+        # holds a crowd (best 5 s window: 67% of frames at 5+), so the rule
+        # would go unexercised; a real pavement would use far more.
+        crowd_people: 4
+
+perception:
+  attributes:
+    plate:
+      enabled: false
+    color:
+      enabled: false
+    person:
+      enabled: false

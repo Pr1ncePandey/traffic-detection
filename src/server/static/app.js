@@ -1024,7 +1024,8 @@ async function loadVocabulary() {
   fillSelect("#o-class", v.classes, "all classes", true);
   fillSelect("#o-group", v.groups, "all groups", true);
   fillSelect("#o-attrkey", Object.keys(v.attributes), "any attribute", true);
-  fillSelect("#i-kind", ["wrong_way", "wrong_lane", "congestion"], "all kinds", true);
+  fillSelect("#i-kind", ["wrong_way", "wrong_lane", "congestion", "face_match",
+    "intrusion", "loitering", "crowd", "running"], "all kinds", true);
   const models = (S.health && S.health.search && S.health.search.models) || [];
   const def = (S.health && S.health.search && S.health.search.default_model);
   if (models.length) {

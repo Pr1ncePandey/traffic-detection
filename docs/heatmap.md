@@ -220,7 +220,9 @@ scaling to the 99th percentile. Checked again by eye on both clips:
    the browser, so the burnt-in heatmap does not appear there yet. Needs a
    `/heatmap/{camera}.png` endpoint (the live grid) and a canvas layer.
 2. Periodic snapshots to the database for hour/day comparisons.
-3. Then the analysis layer: zones, dwell, unique visits, paths - see the
+3. Then the analysis layer: zones, dwell, unique visits, paths - zones,
+   dwell and entries now exist in `analysis/behaviour.py`
+   (docs/human-behaviour.md); paths do not. See the
    sector use cases above.
 4. Perspective weighting (far cells cover more ground) and a person-detection
    confidence floor to cut false people (e.g. through bus windows).
