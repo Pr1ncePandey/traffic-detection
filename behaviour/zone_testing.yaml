@@ -1,0 +1,44 @@
+# Behaviour zones for the zone-testing clip: a busy street crossing filmed from
+# above (4K, 60 fps, 20.2 s). The clip is a download, so it stays out of the
+# repo; it is read from wherever it lives:
+#
+#   python main.py --camera zone_testing --source <path>/zone-testing.mp4 \
+#       --behaviour behaviour/zone_testing.yaml --analyse-fps 30 \
+#       --disable plate,color,person,counting,lanes --no-frames \
+#       --db outputs/zone_testing/behaviour.db
+#
+# There is no cameras/zone_testing.yaml, on purpose: behaviour is not a camera
+# setting. --camera only names the output folder.
+#
+# Zones drawn on a 5% grid of the frames at 0.5 s and 16 s. The camera is
+# hand-held but steady: a fixed sign moves at most ~60 px sideways and ~100 px
+# vertically over the clip (under 5% of the frame), so zones stay on the same
+# ground.
+#
+#   road      the upper roadway, away from where the crowd crosses. restricted:
+#             a person walking or standing on it is an intrusion. Loitering
+#             after 10 s - short because the clip is 20 s.
+#   waiting   the left pavement by the pole, where people wait to cross.
+#   crossing  the band the crowd crosses in. Crowd at 10+ people.
+
+# The pole's base under the green bin is detected as a tall thin "person"
+# at the bottom-left edge.
+exclude:
+  - [[0.0, 0.84], [0.05, 0.84], [0.05, 1.0], [0.0, 1.0]]
+
+zones:
+  - name: "road"
+    # Lower edge at y 0.45: crossing pedestrians have their feet at 0.55-0.85,
+    # people walking up the road at 0.45 or above. The right edge runs along
+    # the parked cars' doors. (Widened from 0.72-0.80 for margin around the man
+    # standing by the parked white car; the run showed his feet were already
+    # inside the narrower edge, so the alerts did not change.)
+    polygon: [[0.08, 0.0], [0.80, 0.0], [0.85, 0.30], [0.86, 0.45], [0.12, 0.45]]
+    restricted: true
+    loitering_s: 10
+  - name: "waiting"
+    polygon: [[0.0, 0.30], [0.10, 0.30], [0.18, 1.0], [0.0, 1.0]]
+    loitering_s: 10
+  - name: "crossing"
+    polygon: [[0.12, 0.50], [0.85, 0.50], [0.85, 0.95], [0.18, 0.95]]
+    crowd_people: 10

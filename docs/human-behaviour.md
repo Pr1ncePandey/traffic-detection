@@ -421,6 +421,106 @@ alerts are ever wanted in the service.
 `cameras/behaviour_demo.yaml`. The zones and results are unchanged by the move
 to `behaviour/person_test.yaml`.)
 
+### Second clip: busy street crossing from above (`zone_testing`)
+
+A downloaded 4K, 60 fps, 20.2 s clip of a street crossing filmed from high up.
+12–22 people are in view at once, crossing the road and passing parked cars.
+It stays local and is read from its download path. Zones:
+`behaviour/zone_testing.yaml`.
+
+```bash
+python main.py --camera zone_testing --source <path>/zone-testing.mp4     --behaviour behaviour/zone_testing.yaml --analyse-fps 30     --disable plate,color,person,counting,lanes --no-frames     --db outputs/zone_testing/behaviour.db
+```
+
+There is no `cameras/zone_testing.yaml`; `--camera` only names the output
+folder.
+
+**Why this clip.** Two earlier candidates were rejected before any zones were
+drawn:
+
+| Clip | Rejected because |
+|---|---|
+| marathon, 6.5 s | runners come towards the camera, so measured speed peaked at 0.9 body heights/s (0 `running`); too short for loitering |
+| marathon from a bridge, 12.7 s | the camera moves: it drifts and zooms, and the picture shifts by half its width, so a fixed zone slides over different ground |
+
+**Checking the camera is fixed.** The first motion estimate (ORB feature
+matching) said this clip drifted ~1,450 px. The walking crowd had fooled it.
+Tracking only a fixed object, the crossing sign on the pole, showed the real
+wobble: at most 61 px sideways and 106 px vertically over 20 s. That is under 5%
+of the frame and under a fifth of a person's height. Lesson: measure camera
+motion on something that cannot move.
+
+**Zones.**
+- `road` (restricted, loitering 10 s): the upper roadway away from where the
+  crowd crosses. Its lower edge is at y 0.45, because crossers have their feet
+  at 0.55–0.85 and people walking up the road at 0.45 or above.
+- `waiting` (loitering 10 s): the left pavement by the pole.
+- `crossing` (crowd at 10 people): the crossing band.
+- A mask on the pole's base, which YOLO boxes as a tall thin "person".
+
+On the drawn frames the first road edge seemed to leave the man by his car
+just outside, so it was widened to the car doors for margin. The run showed
+this made no difference (see below).
+
+**Run.** 491 s on CPU for the 20 s clip (1.2 fps; decoding 4K and YOLO are the
+cost). The behaviour analysis took **1.56 ms per frame**, with ~16 people per
+frame. 197 tracks.
+
+**Every alert and every near-miss was checked by eye** (contact sheets, feet
+traces, crops):
+
+| Rule | Result | By eye |
+|---|---|---|
+| intrusion (`road`) | **5 alerts** | **All real**: 4 people on the roadway (a pair walking up the road, a man crossing the upper road, the man by his parked car). The man by the car alerted **twice**, because his track broke once (tracks 9 and 61) |
+| intrusion, near-misses | 6 tracks inside `road` without alerting | **All correct**: crossers whose feet poked over the edge for 0.0–0.8 s, under `intrusion_s` |
+| loitering (`road`) | **1 alert** | **Correct**: the man standing by his car for 15.6 s (alert at 10 s) |
+| loitering (`waiting`) | 0 alerts | **Correct**, checked per person: the woman in red crossed after ~9 s; the man in red on the phone waited ~5 s and walked off, and at 8 s the tracker **swapped his id onto another man**; others were in the zone 5–7 s when the clip ended |
+| loitering, near-miss | a man walking slowly across `road` reached 9.9 s | a walking person almost triggered loitering, see limitations |
+| crowd (`crossing`, 10+) | 0 events | peak 13, but never 10+ in 80% of a 5 s window; plausible for this crossing |
+| running | 0 events | **correct**: nobody runs. Speed p50 0.4, p90 0.6, p99 1.1 body heights/s |
+
+**Result: 6 alerts, all real (0 false). 1 duplicate** (same person, broken
+track). **No missed intrusion or loitering** among the people the detector saw.
+
+The first run used the narrower road edge and produced **the same 5
+intrusions and 1 loitering**. The man's detected feet were already inside the
+old edge; judging the edge by eye on a downscaled frame had overstated the
+problem. The per-person checks above come from replaying the stored detections
+with the final zones.
+
+**The replay agrees with a real run again.** The final zones were run end to
+end (`behaviour_final.db`, 331 s, 1.12 ms per frame for the analysis). It
+produced the identical 6 alerts on the identical tracks at the identical times:
+intrusions at 1.00, 1.00, 1.07, 5.53 and 11.23 s, loitering at 14.53 s. The zone
+statistics also match (road 11 entries, max dwell 15.6 s).
+
+**What this clip showed that the first did not:**
+
+1. **Tracker id swaps and breaks decide the edge cases.** A broken track gave a
+   duplicate intrusion. A swap handed a waiting man's id to someone else. Both
+   are tracker behaviour, not rule behaviour. The duplicate is also why
+   intrusion incident ids carry the object id: storage cannot merge two tracks
+   of one person, so a consumer sees two incidents.
+2. **Loitering is time in a zone, not standing still.** A man walking slowly
+   across a large zone reached 9.9 s of a 10 s limit. Big zones need a
+   proportionally longer limit, or a "mostly stationary" condition (a speed
+   ceiling while the clock runs) if walkers must never count.
+3. **The passenger rule misfires for high cameras.** From above, a parked car's
+   box is tall, so a pedestrian standing behind the taxi or the van is fully
+   inside it and dropped as a "passenger". 3 tracks here, all in the crossing
+   band, so no alert was lost, but on a camera like this the passenger test
+   needs more than overlap (for example, only `bus`, or the person's box
+   clearly smaller than the vehicle's).
+4. **Camera-motion checks must use fixed objects**, as above.
+
+5. **Overlay text does not scale with resolution.** On the 4K annotated video the
+   `INTRUSION` and `LOITERING` labels are correct but tiny, because the font
+   size is fixed and suits 720p–1080p. Scaling it with the frame height is a
+   one-line change, not made here.
+
+Not testable on this clip: **running** (nobody runs) and **a bag left behind**
+(bags are all carried). Both still need a fixed-camera clip that contains them.
+
 ## Not done (next steps)
 
 1. **A snapshot per incident**, so `image_url` works while the person is still
