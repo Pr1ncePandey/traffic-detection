@@ -58,6 +58,10 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--heavy-reads", type=int, default=3)
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--max-people", type=int, default=0,
+                    help="only the N largest people (by tallest box); 0 = everyone. "
+                         "Chosen from the CSV before the video is read, so a long "
+                         "clip does not hold every crop in memory")
     args = ap.parse_args()
 
     conf = block(load_for_camera(None), "person")
@@ -69,6 +73,12 @@ def main():
 
     df = pd.read_csv(args.csv)
     people = df[df.cls_group == "person"]
+    if args.max_people > 0:
+        rows_per_track = people.groupby("object_id").size()
+        tallest = (people.y2 - people.y1).groupby(people.object_id).max()
+        enough = rows_per_track[rows_per_track >= min_reads * read_every].index
+        keep = tallest.loc[enough].sort_values(ascending=False).head(args.max_people).index
+        people = people[people.object_id.isin(keep)]
     umb = df[df.vehicle_class == "umbrella"]
     by_frame = {f: g for f, g in people.groupby("frame")}
     umb_by = {f: [tuple(int(v) for v in r) for r in g[["x1", "y1", "x2", "y2"]]

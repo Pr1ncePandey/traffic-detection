@@ -38,3 +38,6 @@ models/MiVOLO/
 # republish. Keep local.
 samples/person_test.mp4
 samples/person_test2.mp4
+
+# Consented test footage of real people (faces + clothing). Never pushed.
+samples/model_test.mp4
