@@ -1,7 +1,7 @@
 """Eyeball test for the person-attribute model on real footage.
 
     python tools/eval_person_attr.py
-    python tools/eval_person_attr.py --video samples/person_test.mp4 \
+    python tools/eval_person_attr.py --video samples/short/person_test.mp4 \
         --csv outputs/person_attr_eval_person_test/tracks.csv \
         --out outputs/person_attr_eval_person_test
 
@@ -43,7 +43,7 @@ SHORT = {"gender": "", "age_group": "age ", "facing": "", "sleeves": "sleeve ",
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--video", default="samples/indian_road.mp4")
+    ap.add_argument("--video", default="samples/short/indian_road.mp4")
     ap.add_argument("--csv", default="outputs/tracks_v2.csv")
     ap.add_argument("--out", default="outputs/person_attr_eval")
     ap.add_argument("--config", default="config.yaml")
@@ -61,7 +61,7 @@ def main():
     model = PersonAttrModel(conf.get("model", "models/person_attr/person_attr.onnx"))
 
     df = pd.read_csv(args.csv)
-    name = df["vehicle_class"] if "vehicle_class" in df else df["cls_group"]
+    name = df["cls_name"] if "cls_name" in df else df["cls_group"]
     people = df[df.cls_group == "person"]
     umbrellas = df[name == UMBRELLA]
     by_frame = {f: g for f, g in people.groupby("frame")}

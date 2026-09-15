@@ -60,6 +60,7 @@ from .storage.csv_store import CsvStore
 from .storage.frames import Reaper, build_writer
 from .storage.sqlite_store import SqliteStore
 from .timebase import time_base_for
+from .trackers.identity import KIND_PLATE
 from .trackers.identity import from_config as identity_from_config
 from .trackers.store import TrackStore, ttl_for
 
@@ -88,7 +89,7 @@ def _label(det, store=None):
     what makes the system look like it has forgotten. V7 is the same car.
     """
     tid = "?" if det.track_id is None else det.track_id
-    vid = None if store is None else store.vehicle_of.get(det.track_id)
+    vid = None if store is None else store.identity_of.get(det.track_id)
     tag = (f"V{vid} {det.cls_name} {det.conf:.2f}" if vid is not None
            else f"#{tid} {det.cls_name} {det.conf:.2f}")
     if det.lane_id:
@@ -199,10 +200,11 @@ def parse_recorded_at(raw) -> float | None:
 
 
 def run_pipeline(cfg: dict, stop=None, on_frame=None, on_event=None,
-                 on_ready=None, storage=None, progress: bool = True) -> dict:
+                 on_ready=None, on_video=None, storage=None,
+                 progress: bool = True) -> dict:
     """Run one camera to completion, or until `stop` is set.
 
-    The four optional arguments are what let a long-running server drive this
+    The five optional callbacks are what let a long-running server drive this
     loop without the loop knowing a server exists. All default to None, so a
     one-shot `python main.py` takes exactly the path it always did.
 
@@ -218,6 +220,12 @@ def run_pipeline(cfg: dict, stop=None, on_frame=None, on_event=None,
       on_ready  called once with the run's own facts (run_id, source info)
                 after start-up succeeds, so a supervisor can mark the camera
                 healthy and show its resolution and fps.
+      on_video  called with the CLEAN frame, for a video sink. `raw`, never
+                `annotated`: the dashboard draws its own boxes from on_frame's
+                metadata, so burnt-in ones would double up and could not be
+                toggled or filtered. Encoding is the sink's problem, not this
+                loop's - see src/server/video.py, which skips the work
+                entirely when nobody is watching.
 
     Callbacks are invoked inside the frame loop, so a slow one slows the camera.
     Each is wrapped: a subscriber raising must not kill the run - see _safely().
@@ -414,13 +422,13 @@ def run_pipeline(cfg: dict, stop=None, on_frame=None, on_event=None,
                     "x1": det.bbox[0], "y1": det.bbox[1],
                     "x2": det.bbox[2], "y2": det.bbox[3],
                     "conf": round(det.conf, 3), "cls_name": det.cls_name,
-                    "event": det.event or "", "lane_id": det.lane_id or "",
+                    "lane_id": det.lane_id or "",
                     "lane_flag": det.lane_flag or ""})
                 if csv is not None:
                     csv.put({"frame": analysed, "time_s": round(timestamp, 2),
                              "object_id": det.track_id,
-                             "vehicle_id": store.vehicle_of.get(det.track_id),
-                             "vehicle_class": det.cls_name,
+                             "identity_id": store.identity_of.get(det.track_id),
+                             "cls_name": det.cls_name,
                              "cls_group": det.group, "confidence": round(det.conf, 3),
                              "x1": det.bbox[0], "y1": det.bbox[1],
                              "x2": det.bbox[2], "y2": det.bbox[3],
@@ -452,6 +460,11 @@ def run_pipeline(cfg: dict, stop=None, on_frame=None, on_event=None,
                 _safely(on_frame, _frame_meta(camera_id, analysed, timestamp,
                                               ctx, store, storage, reader),
                         what="on_frame")
+            # `raw` and not `annotated`, for the reason in the docstring above.
+            # raw is never mutated (see runtime/context.py), so handing it out
+            # here is safe for the rest of this iteration.
+            if on_video is not None:
+                _safely(on_video, raw, what="on_video")
 
             if analysed % evict_every == 0:
                 store.evict_stale(timestamp, ttl,
@@ -471,8 +484,8 @@ def run_pipeline(cfg: dict, stop=None, on_frame=None, on_event=None,
         source.release()
         # Everything still tracked at shutdown must be written, or the last
         # objects of a run would exist only in memory.
-        for tid, vehicle in list(store.vehicles.items()):
-            _finalize(storage, store, stages, tid, vehicle, identity,
+        for tid, track in list(store.tracks.items()):
+            _finalize(storage, store, stages, tid, track, identity,
                       reid_min_conf, reid_require_format,
                       on_retire=on_event, camera=camera_id, run_id=run_id)
         for st in stages:
@@ -518,15 +531,54 @@ def run_pipeline(cfg: dict, stop=None, on_frame=None, on_event=None,
             "summaries": summaries}
 
 
+# Bookkeeping rather than description, so a live box does not carry these.
+# `plate_number` has its own field; `prev_xy` is scratch space lane_model.py
+# asked the pipeline to pre-compute.
+_ATTR_SKIP = ("prev_xy", "plate_number")
+
+
+def _live_attrs(det) -> dict:
+    """Everything an enricher said about this object, minus the bookkeeping.
+
+    EXCLUSION, NOT A WHITELIST. A new enricher shows up on the dashboard with
+    no change here, which is the same bet router.load_vocabulary makes when it
+    reads its vocabulary from the database instead of hardcoding one. The cost
+    is that a plugin writing junk into `det.extra` (runtime/plugin.py lets one
+    `update()` it freely) would display that junk - so values are restricted
+    to scalars, which also keeps this JSON-serialisable without a custom
+    encoder.
+
+    The `_conf` twins are dropped: every enricher stores `<key>` next to
+    `<key>_conf`, and a confidence per attribute is more than a live box can
+    legibly show. They remain in the `attributes` table for anyone querying it.
+    """
+    out = {}
+    for key, value in (det.extra or {}).items():
+        if key in _ATTR_SKIP or key.endswith("_conf"):
+            continue
+        # Scalars only. None is excluded by this check too, which is why
+        # there is no separate null test below.
+        if not isinstance(value, (str, int, float, bool)):
+            continue
+        if value == "" or value is False:
+            continue          # an unread attribute, not a finding
+        out[key] = value
+    return out
+
+
 def _frame_meta(camera: str, frame_no: int, timestamp: float, ctx, store,
                 storage, reader) -> dict:
     """The live-view payload for one frame. METADATA ONLY.
 
-    No pixels: the dashboard draws these boxes client-side. ~30 boxes at ~120
-    bytes is about 4 KB, so at the hub's 8 Hz push rate a viewer costs ~32 KB/s
-    - which is the whole reason the metadata option was chosen over streaming
-    video. ctx.annotated still holds the drawn frame if an MJPEG endpoint is
-    ever wanted, so that stays a small addition rather than a rewrite.
+    No pixels HERE. The dashboard draws these boxes client-side, over the
+    JPEG stream that src/server/video.py serves separately from `raw` - the
+    two arrive on different channels precisely so the boxes stay data rather
+    than becoming part of the picture.
+
+    A vehicle box is ~120 bytes and a person box carrying its attributes is
+    closer to ~260, so ~30 boxes is 4-8 KB; at the hub's 8 Hz that is
+    ~32-64 KB/s per viewer. Still small enough that the metadata channel is
+    not what costs anything - the video stream beside it is.
 
     `health` is here rather than on a separate endpoint because these are the
     numbers that go stale fastest, and a feed silently degrading is the thing
@@ -538,13 +590,14 @@ def _frame_meta(camera: str, frame_no: int, timestamp: float, ctx, store,
             continue
         boxes.append({"track_id": det.track_id,
                       "object_id": store.object_ids.get(det.track_id),
-                      "vehicle_id": store.vehicle_of.get(det.track_id),
+                      "identity_id": store.identity_of.get(det.track_id),
                       "cls": det.cls_name, "group": det.group,
                       "conf": round(float(det.conf), 3),
                       "xyxy": [int(v) for v in det.bbox],
                       "lane_id": det.lane_id or None,
                       "lane_flag": det.lane_flag or None,
-                      "plate": det.extra.get("plate_number") or None})
+                      "plate": det.extra.get("plate_number") or None,
+                      "attrs": _live_attrs(det)})
     return {"camera": camera, "frame_no": frame_no,
             "ts": round(float(timestamp), 3), "boxes": boxes,
             "counts": dict(store.lane_counts),
@@ -557,7 +610,7 @@ def _frame_meta(camera: str, frame_no: int, timestamp: float, ctx, store,
                        "rows_failed": storage.rows_failed,
                        "write_alarm": storage.write_alarm,
                        "frames_dropped": getattr(reader, "frames_dropped", 0),
-                       "tracked": len(store.vehicles),
+                       "tracked": len(store.tracks),
                        "state_size": store.state_size()}}
 
 
@@ -574,22 +627,22 @@ def _keep_best_crop(store, det, raw, crop_dir, save_crops, min_conf):
     crop = raw[y1:y2, x1:x2]
     if crop.size == 0:
         return
-    vehicle = store.vehicles.get(det.track_id)
-    if vehicle is None:
+    track = store.tracks.get(det.track_id)
+    if track is None:
         return
-    have = vehicle.get("_crop_path") is not None
+    have = track.get("_crop_path") is not None
     # Below the confidence bar we still take a first image (so every object has
     # one) but never overwrite an image taken above it.
     if have and det.conf < min_conf:
         return
     score = crop_score(crop)
-    if have and score <= float(vehicle.get("_crop_score", 0.0)):
+    if have and score <= float(track.get("_crop_score", 0.0)):
         return
-    vehicle["_crop_score"] = score if det.conf >= min_conf else 0.0
+    track["_crop_score"] = score if det.conf >= min_conf else 0.0
     path = os.path.join(crop_dir, f"object_{store.object_ids[det.track_id]}.jpg")
     try:
         cv2.imwrite(path, crop)
-        vehicle["_crop_path"] = path
+        track["_crop_path"] = path
     except Exception as e:
         print(f"[pipeline] crop write failed {path}: {e}")
 
@@ -618,7 +671,7 @@ def _bind_identities(identity, ctx, min_conf: float, require_format: bool):
     Runs every frame, after the analyzers and before the labels are drawn.
     Provisional by nature: plate._consensus() keeps voting as more reads
     accumulate, so the string can still change. Rebinding on change is cheap
-    and self-correcting - only the caption and objects.vehicle_id depend on it,
+    and self-correcting - only the caption and objects.identity_id depend on it,
     and _finalize() re-resolves from the FINAL voted plate. No detection row
     ever references a vehicle id, so nothing needs rewriting.
     """
@@ -633,15 +686,16 @@ def _bind_identities(identity, ctx, min_conf: float, require_format: bool):
         if not _plate_is_bindable(plate, det.extra.get("plate_conf", 0.0),
                                   min_conf, require_format):
             continue
-        vehicle_id = identity.resolve(plate, ctx.timestamp)
-        if vehicle_id is None:
+        identity_id = identity.resolve(plate, ctx.timestamp)
+        if identity_id is None:
             continue
-        previous = store.vehicle_of.get(tid)
+        previous = store.identity_of.get(tid)
         store.plate_of[tid] = plate
-        store.vehicle_of[tid] = vehicle_id
-        if vehicle_id != previous:
-            ctx.emit("vehicle_identified",
-                     {"vehicle_id": vehicle_id, "plate": plate,
+        store.identity_of[tid] = identity_id
+        if identity_id != previous:
+            ctx.emit("identity_bound",
+                     {"identity_id": identity_id, "identity_kind": KIND_PLATE,
+                      "plate": plate,
                       "conf": det.extra.get("plate_conf", 0.0),
                       "rebound_from": previous},
                      track_id=tid)
@@ -662,47 +716,47 @@ def _attr_conf(attrs: dict, key: str) -> float:
     return 0.0
 
 
-def _settled_vehicle_id(storage, identity, store, tid, vehicle, attrs,
-                        min_conf: float, require_format: bool):
-    """The vehicle id to persist for a retiring track.
+def _settled_identity_id(storage, identity, store, tid, track, attrs,
+                         min_conf: float, require_format: bool):
+    """The identity id to persist for a retiring track.
 
     Prefers a fresh resolve of the FINAL voted plate over whatever was bound
     mid-track: _bind_identities works from a running consensus that is still
     being voted, so an early binding can be superseded. Falls back to the
     mid-track binding, then to None.
     """
-    bound = store.vehicle_of.get(tid)
+    bound = store.identity_of.get(tid)
     if identity is None:
         return bound
     plate = attrs.get("plate_number", "") or ""
     if not _plate_is_bindable(plate, _attr_conf(attrs, "plate_number"),
                               min_conf, require_format):
         return bound
-    resolved = identity.resolve(plate, vehicle.get("last_seen_s", 0.0))
+    resolved = identity.resolve(plate, track.get("last_seen_s", 0.0))
     if resolved is None:
         return bound
     # Submit the sighting's real bounds. resolve() only ever knows the instant
     # a plate became legible, which is part-way through the track; the upsert
     # takes MIN/MAX, so this widens the vehicle's window to cover when the car
     # was actually visible rather than when its plate happened to be readable.
-    touch = getattr(storage, "touch_vehicle", None)
+    touch = getattr(storage, "touch_identity", None)
     if touch is not None:
         try:
-            touch(resolved, plate, vehicle.get("first_seen_s", 0.0),
-                  vehicle.get("last_seen_s", 0.0))
+            touch(resolved, KIND_PLATE, plate, track.get("first_seen_s", 0.0),
+                  track.get("last_seen_s", 0.0))
         except Exception as e:
-            print(f"[pipeline] vehicle touch failed for {resolved}: {e}")
+            print(f"[pipeline] identity touch failed for {resolved}: {e}")
     return resolved
 
 
-def _finalize(storage, store, stages, tid, vehicle, identity=None,
+def _finalize(storage, store, stages, tid, track, identity=None,
               min_conf: float = 0.7, require_format: bool = True,
               on_retire=None, camera: str = "", run_id=None):
     """Persist an object row plus its attributes, then let plugins forget it.
 
     This is where identity becomes authoritative. Any binding made mid-track
     used a running consensus; by the time a track is retired the vote is
-    complete, so the final plate is re-resolved and that is the vehicle_id
+    complete, so the final plate is re-resolved and that is the identity_id
     written to the row.
 
     It is also the incident layer's firing point, which is why `on_retire`
@@ -717,22 +771,22 @@ def _finalize(storage, store, stages, tid, vehicle, identity=None,
     oid = store.object_ids.get(tid)
     if oid is None:
         return
-    attrs = vehicle.get("attrs", {}) or {}
-    vehicle_id = _settled_vehicle_id(storage, identity, store, tid, vehicle,
-                                     attrs, min_conf, require_format)
+    attrs = track.get("attrs", {}) or {}
+    identity_id = _settled_identity_id(storage, identity, store, tid, track,
+                                       attrs, min_conf, require_format)
     storage.upsert_object({
-        "id": oid, "track_id": tid, "vehicle_id": vehicle_id,
+        "id": oid, "track_id": tid, "identity_id": identity_id,
         **({} if run_id is None else {"run_id": run_id}),
-        "cls_name": vehicle.get("vehicle_class", ""),
-        "cls_group": vehicle.get("cls_group", ""),
-        "first_seen_s": vehicle.get("first_seen_s", 0.0),
-        "last_seen_s": vehicle.get("last_seen_s", 0.0),
-        "frames_seen": vehicle.get("frames_seen", 0),
-        "best_conf": vehicle.get("best_conf", 0.0),
-        "crop_path": vehicle.get("_crop_path"),
+        "cls_name": track.get("cls_name", ""),
+        "cls_group": track.get("cls_group", ""),
+        "first_seen_s": track.get("first_seen_s", 0.0),
+        "last_seen_s": track.get("last_seen_s", 0.0),
+        "frames_seen": track.get("frames_seen", 0),
+        "best_conf": track.get("best_conf", 0.0),
+        "crop_path": track.get("_crop_path"),
         "lane_id": store.lane_of.get(tid),
         "lane_flag": store.lane_flag_of.get(tid)})
-    ts = vehicle.get("last_seen_s", 0.0)
+    ts = track.get("last_seen_s", 0.0)
     for key, value in attrs.items():
         if key.endswith("_conf") or value in ("", None):
             continue
@@ -746,15 +800,21 @@ def _finalize(storage, store, stages, tid, vehicle, identity=None,
         _safely(on_retire,
                 {"kind": "track_retired", "track_id": tid, "ts": ts,
                  "detail": {
-                     "object_id": oid, "vehicle_id": vehicle_id,
+                     # identity_kind names the AXIS identity_id sits on, so a
+                     # consumer can tell a plate-keyed vehicle from an
+                     # appearance-clustered person once identities.kind has a
+                     # second value. None when nothing bound.
+                     "object_id": oid, "identity_id": identity_id,
+                     "identity_kind": (KIND_PLATE if identity_id is not None
+                                       else None),
                      "plate": attrs.get("plate_number") or None,
                      "plate_conf": _attr_conf(attrs, "plate_number"),
-                     "cls_name": vehicle.get("vehicle_class", ""),
+                     "cls_name": track.get("cls_name", ""),
                      "colour": attrs.get("color") or None,
-                     "first_seen_s": vehicle.get("first_seen_s", 0.0),
-                     "last_seen_s": vehicle.get("last_seen_s", 0.0),
-                     "frames_seen": vehicle.get("frames_seen", 0),
-                     "crop_path": vehicle.get("_crop_path"),
+                     "first_seen_s": track.get("first_seen_s", 0.0),
+                     "last_seen_s": track.get("last_seen_s", 0.0),
+                     "frames_seen": track.get("frames_seen", 0),
+                     "crop_path": track.get("_crop_path"),
                      "lane_id": store.lane_of.get(tid),
                      "lane_flag": store.lane_flag_of.get(tid)}},
                 {"camera": camera, "object_id": oid, "timestamp": ts},
@@ -793,7 +853,7 @@ def _write_summary(cfg, info, store, elapsed, read_n, analysed, summaries, write
             # "identities created", not "vehicles seen", and deliberately NOT
             # a re-entry count: this process cannot tell a second sighting from
             # the same track re-resolving at finalize. The number of cars that
-            # actually came back is a question about objects.vehicle_id, which
+            # actually came back is a question about objects.identity_id, which
             # report.py answers exactly.
             f.write(f"Vehicle identities created: {st['vehicles_created']} "
                     f"(plates that bound to a durable id)\n")

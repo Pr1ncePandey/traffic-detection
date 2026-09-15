@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 
 df = pd.read_csv("outputs/full_lane.csv")
-cap = cv2.VideoCapture("samples/input.mp4")
+cap = cv2.VideoCapture("samples/short/input.mp4")
 W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 for fno in [1000, 1050]:

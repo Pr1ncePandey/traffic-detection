@@ -130,10 +130,24 @@ class CropReaper:
         if cleared:
             # Null the column so a query does not advertise a file that is
             # gone. Batched to bound statement size.
-            self.store.prune([
-                ("UPDATE objects SET crop_path=NULL WHERE id IN ("
-                 + ",".join("?" * len(chunk)) + ")", tuple(chunk))
-                for chunk in _chunks(cleared, 400)])
+            #
+            # And drop the search vectors in the SAME prune batch, on the same
+            # writer connection, in order. A vector whose crop is gone is
+            # worse than no vector: open-vocabulary search would return a hit
+            # that cannot be viewed (`/crops/{id}.jpg` 404s) or verified, and
+            # the index would rot over days with no error anywhere. Keeping
+            # vectors in this database is what makes that one extra statement
+            # instead of a distributed-consistency problem.
+            statements = []
+            for chunk in _chunks(cleared, 400):
+                marks = ",".join("?" * len(chunk))
+                statements.append(
+                    (f"DELETE FROM embeddings WHERE object_id IN ({marks})",
+                     tuple(chunk)))
+                statements.append(
+                    (f"UPDATE objects SET crop_path=NULL WHERE id IN ({marks})",
+                     tuple(chunk)))
+            self.store.prune(statements)
         self.deleted += removed
         self.deleted_bytes += freed
         return removed

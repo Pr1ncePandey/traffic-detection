@@ -14,7 +14,7 @@ an external endpoint with a complete payload.
 | Question | Decision |
 |---|---|
 | Process model | One server, N camera worker threads, one DB writer |
-| Live view | Metadata over WebSocket, drawn client-side |
+| Live view | Metadata over WebSocket, drawn client-side over MJPEG video (revised — see Layer C) |
 | Webhook delivery | Persisted outbox, retry with backoff |
 | Payload timing | Fire once, on track retirement |
 | Congestion trigger | State transition both ways, after a minimum dwell |
@@ -39,7 +39,7 @@ would not be if it were the only output.
 **Incidents are already first-class events.** `lanes.py:208` emits
 `wrong_way` with its verdict detail, `counting.py:41` emits `crossing`,
 `congestion.py:119` emits `congestion`, and the pipeline emits
-`vehicle_identified` (`pipeline.py:396`). All land in
+`identity_bound` (`pipeline.py:396`). All land in
 `events(run_id, frame_id, object_id, kind, detail_json, ts)`. The webhook layer
 hooks the drain, not the analyzers — no detector needs touching.
 
@@ -139,8 +139,8 @@ GET  /cameras                     configured cameras + live status
 GET  /cameras/{id}                detail: fps, queue depth, drops, counts
 POST /cameras/{id}/start|stop     control plane
 GET  /incidents                   recent incidents, filterable by kind
-GET  /vehicles/{id}               sightings across cameras
-GET  /vehicles/{id}/path          journeys (see multi-camera-paths.md)
+GET  /identities/{id}             sightings across cameras
+GET  /identities/{id}/path        journeys (see multi-camera-paths.md)
 GET  /crops/{object_id}.jpg       serves objects.crop_path
 WS   /live/{camera_id}            frame metadata stream
 ```
@@ -153,17 +153,37 @@ read. This endpoint is what makes an image URL possible in the payload.
 
 ## Layer C — live dashboard
 
-Metadata only, per the decision. Per-message payload:
+**This channel** is metadata only, and stays that way: the pixels travel
+separately (see the video note below), so that the boxes remain data.
+Per-message payload:
 
 ```json
 {"camera": "demo", "frame_no": 1423, "ts": 1757664000.12,
- "boxes": [{"track_id": 88, "cls": "car", "xyxy": [420, 300, 512, 388],
+ "boxes": [{"track_id": 88, "object_id": 1841, "identity_id": 7,
+            "cls": "car", "group": "vehicle", "conf": 0.82,
+            "xyxy": [420, 300, 512, 388],
             "lane_id": "right_going", "lane_flag": "wrong_way",
-            "plate": "MH12AB1234", "vehicle_id": 7}],
+            "plate": "MH12AB1234",
+            "attrs": {"color": "white"}}],
  "counts": {"top (exit)": 214, "bottom (entry)": 198},
+ "crossings": {"a_to_b": 214, "b_to_a": 198},
+ "flagged": {"wrong_way": 1, "wrong_lane": 0},
  "congestion": "clear",
- "health": {"fps": 27.4, "queue_depth": 12, "dropped": 0}}
+ "health": {"queue_depth": 12, "rows_dropped": 0, "rows_failed": 0,
+            "write_alarm": false, "frames_dropped": 0, "tracked": 18,
+            "state_size": 212}}
 ```
+
+`attrs` carries whatever the enrichers read for that object — colour for a
+vehicle, and for a person the garment and appearance keys. It is built by
+EXCLUSION (everything in `det.extra` that is not a `_conf` twin or internal
+bookkeeping), so enabling a new enricher shows up on the dashboard with no
+change to the pipeline or the UI. A person box is ~260 bytes against ~120 for
+a vehicle, which is the whole reason the payload figures below have a range.
+
+The dashboard filters *absent* attribute values (`bag: none`, `hat: no`) out of
+its badges and box labels, while the object drawer shows them all: "no hat" is
+worth knowing about one object and pure noise across ninety.
 
 **Throttle independently of `analyse_fps`.** Push at a fixed rate (default
 ~8 Hz) regardless of how fast the pipeline runs. Nobody can read 30 updates a
@@ -176,10 +196,33 @@ one level up.
 **Cost.** ~30 boxes at ~120 bytes is roughly 4 KB per message; at 8 Hz that is
 ~32 KB/s per viewer. Negligible, which is the point of this option.
 
-**Video is deliberately out of scope here.** The dashboard draws overlays on a
-schematic or over a separately served stream. If real frames are wanted later,
-`ctx.annotated` already holds the drawn frame, so an MJPEG endpoint is a small
-addition — it just is not on the critical path.
+**Video was deliberately out of scope here — that decision has been revised.**
+
+The original reasoning was sound on cost: ~4 KB of JSON beats a video stream
+when the boxes are the payload. What it got wrong was the purpose. Boxes over a
+blank schematic answer *"is the pipeline running"*, and an operator's actual
+question is *"is it right"* — which needs the road visible underneath, because
+a correct box and a box on nothing look identical without it. The first thing
+anyone said about the shipped dashboard was that the video was missing.
+
+So `src/server/video.py` now fans MJPEG out per camera, `GET
+/stream/{id}.mjpg` serves it, and the metadata channel above is unchanged and
+still carries the boxes. Three things were kept from the original decision and
+are worth not undoing:
+
+- **The frames are clean, not `ctx.annotated`.** Serving the already-drawn
+  frame would have been fewer lines and is the wrong frame: the dashboard
+  draws its own boxes from the metadata, so burnt-in ones double up, and a
+  burnt-in label cannot be toggled, filtered or clicked.
+- **Encoding is skipped when nobody is watching**, falling back to 1 Hz so
+  `/snapshot.jpg` stays fresh. A camera with no viewers pays ~1 ms a second.
+- **The same drop-don't-block rule** as the hub and the write queue: one-slot
+  newest-wins queues, so a stalled tab cannot slow a camera thread.
+
+Measured on `samples/short/indian_road.mp4` (1080p, busy scene): 960 px at quality
+70 is ~83 KB a frame, so ~4.3 Mbit/s per viewer at 8 fps — more than the
+1–3 Mbit/s first estimated, because JPEG size follows scene detail.
+`server.video.enabled: false` restores the metadata-only behaviour exactly.
 
 **Health tiles.** Per camera: fps, write-queue depth, dropped frames, writer
 failures, wrong-way total, congestion state. `identity.stats()`
@@ -199,7 +242,7 @@ growth can be asserted in a long run — exactly what a service needs surfaced.
 | `congestion` | yes, on state change | Own rule — see below |
 | `wrong_lane` | configurable | Noisier; depends on lane confidence |
 | `crossing` | **no** | Every vehicle. It is a counter, not an incident |
-| `vehicle_identified` | no | Internal bookkeeping, fires on every rebind |
+| `identity_bound` | no | Internal bookkeeping, fires on every rebind |
 
 Per-kind enable flags in config, so this is policy rather than code.
 
@@ -242,7 +285,8 @@ carry no `vehicle` block — congestion is a property of the road, not a car.
  "kind": "wrong_way",
  "camera": {"id": "demo", "name": "demo", "lat": 12.9716, "lon": 77.5946},
  "detected_at": 1757664000.12,
- "vehicle": {"vehicle_id": 7, "plate": "MH12AB1234", "plate_conf": 0.83,
+ "vehicle": {"identity_id": 7, "identity_kind": "plate",
+             "plate": "MH12AB1234", "plate_conf": 0.83,
              "cls": "car", "colour": "white"},
  "sighting": {"object_id": 1841, "first_seen": 1757663996.0,
               "last_seen": 1757664001.4, "frames_seen": 162},
@@ -251,8 +295,8 @@ carry no `vehicle` block — congestion is a property of the road, not a car.
  "image_url": "https://host/crops/1841.jpg"}
 ```
 
-`plate` and `vehicle_id` may still be `null` — a vehicle whose plate never read
-confidently has no `vehicles` row at all (`query.py:20` says so). The payload
+`plate` and `identity_id` may still be `null` — a vehicle whose plate never read
+confidently has no `identities` row at all (`query.py:20` says so). The payload
 must be explicit about absence rather than omitting the keys.
 
 ### Outbox
@@ -260,7 +304,7 @@ must be explicit about absence rather than omitting the keys.
 Two tables:
 
 ```sql
-incidents(id, camera, kind, object_id, vehicle_id, payload_json, created_at)
+incidents(id, camera, kind, object_id, identity_id, payload_json, created_at)
 deliveries(id, incident_id, endpoint, attempts, next_attempt_at,
            status, last_error)
 ```

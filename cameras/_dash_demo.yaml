@@ -14,7 +14,7 @@ camera:
   location: {lat: 12.9716, lon: 77.5946}
 
 video:
-  source: "samples/input.mp4"
+  source: "samples/short/input.mp4"
   recorded_at: "2026-09-12T08:30:00"
 
 analyses:

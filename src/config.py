@@ -87,7 +87,7 @@ DEFAULTS = {
     # seconds-from-clip-start and therefore not comparable across cameras until
     # anchored to something real. See src/timebase.py for why this cannot be
     # inferred. Live sources ignore it - they are already on wall-clock.
-    "video": {"source": "samples/input.mp4",
+    "video": {"source": "samples/short/input.mp4",
               "target": "outputs/{camera_id}/annotated.mp4",
               "csv": "outputs/{camera_id}/tracks.csv",
               "summary": "outputs/{camera_id}/summary.txt",
@@ -115,7 +115,7 @@ DEFAULTS = {
             "color": {"enabled": True},
             "plate": {"enabled": True,
                       "det_conf": 0.3, "min_conf": 0.5, "det_imgsz": 480,
-                      "ocr_backend": "paddle_anpr", "ocr_model": "",
+                      "ocr_backend": "fast_plate", "ocr_model": "",
                       "format_correction": True, "join_rows": True,
                       "read_every": 3, "max_reads": 8,
                       "vote": True, "vote_min_conf": 0.8},
@@ -220,11 +220,31 @@ DEFAULTS = {
     # THE SERVICE (serve.py). Host property, so it is locked fleet-wide: a
     # camera file cannot move the listen address out from under the operator.
     #   host      127.0.0.1 and nothing else by default. There is NO
-    #             application-level auth, and /crops serves plate imagery while
-    #             /live streams plate strings, so binding wider publishes both.
+    #             application-level auth; /crops serves plate imagery, /live
+    #             streams plate strings and /stream serves LIVE ROAD FOOTAGE,
+    #             so binding wider publishes all three.
     #   push_hz   WebSocket rate, independent of analyse_fps. Nobody reads 30
     #             updates a second and a file replaying at 3x would flood it.
-    "server": {"host": "127.0.0.1", "port": 8000, "push_hz": 8.0},
+    #   video     the MJPEG stream the dashboard shows under its boxes.
+    #             enabled=False keeps the metadata dashboard and serves no
+    #             pixels at all, which is the pre-video behaviour.
+    #             fps/quality/max_width are the bandwidth dial: 8 Hz at 70%
+    #             and 960 px is roughly 1-3 Mbit/s per viewer. Encoding is
+    #             skipped entirely when no tab is watching, dropping to
+    #             snapshot_fps so /snapshot stays fresh for thumbnails.
+    #   search    open-vocabulary search over embedded crops. `model` is the
+    #             ONE place the embedding space is named - the dashboard
+    #             queries it and the background embedder fills it, so they
+    #             cannot disagree (they used to, and search silently returned
+    #             nothing). embed_in_background keeps the index current on a
+    #             duty cycle; see src/server/embedder.py for the arithmetic.
+    "server": {"host": "127.0.0.1", "port": 8000, "push_hz": 8.0,
+               "video": {"enabled": True, "fps": 8, "quality": 70,
+                         "max_width": 960, "snapshot_fps": 1},
+               "search": {"model": "clip-vit-l14",
+                          "embed_in_background": True,
+                          "batch": 8, "pause_s": 3.0, "idle_poll_s": 30,
+                          "min_px": 48, "min_conf": 0.5, "max_area": 0.33}},
 
     # INCIDENT WEBHOOKS. Policy, not code: which kinds fire is config.
     "incidents": {

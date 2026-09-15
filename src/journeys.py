@@ -1,6 +1,6 @@
 """Reconstruct the route one vehicle took across the camera fleet.
 
-Given that the same car resolved to one `vehicle_id` at several cameras, emit
+Given that the same car resolved to one `identity_id` at several cameras, emit
 the ordered sequence of cameras it passed with the time and distance between
 each.
 
@@ -280,9 +280,9 @@ class Conflict:
 class VehiclePath:
     """Everything known about where one vehicle went."""
 
-    def __init__(self, vehicle_id, plate, journeys, unorderable, conflicts,
+    def __init__(self, identity_id, plate, journeys, unorderable, conflicts,
                  total_sightings):
-        self.vehicle_id = vehicle_id
+        self.identity_id = identity_id
         self.plate = plate
         self.journeys = journeys
         self.unorderable = unorderable
@@ -304,7 +304,7 @@ class VehiclePath:
         return len(self.cameras) > 1
 
     def as_dict(self) -> dict:
-        return {"vehicle_id": self.vehicle_id, "plate": self.plate,
+        return {"identity_id": self.identity_id, "plate": self.plate,
                 "total_sightings": self.total_sightings,
                 "cameras": self.cameras,
                 "journeys": [j.as_dict() for j in self.journeys],
@@ -323,11 +323,11 @@ SELECT o.id, o.run_id, o.cls_name, o.first_seen_s, o.last_seen_s,
          WHERE a.object_id = o.id AND a.key = 'plate_number') plate
 FROM objects o
 JOIN runs r ON r.id = o.run_id
-WHERE o.vehicle_id = ?
+WHERE o.identity_id = ?
 """
 
 
-def build_path(conn, vehicle_id: int, max_gap_s: float = MAX_GAP_S,
+def build_path(conn, identity_id: int, max_gap_s: float = MAX_GAP_S,
                max_speed_kmh: float = MAX_SPEED_KMH) -> VehiclePath | None:
     """Assemble one vehicle's path. None if the vehicle does not exist.
 
@@ -336,11 +336,14 @@ def build_path(conn, vehicle_id: int, max_gap_s: float = MAX_GAP_S,
     without the rest.
     """
     conn.row_factory = sqlite3.Row
-    veh = conn.execute("SELECT * FROM vehicles WHERE id=?",
-                       (int(vehicle_id),)).fetchone()
+    # kind='plate': a journey is built from a plate-keyed vehicle identity. An
+    # appearance-clustered person lives in the same table under another kind and
+    # is not a vehicle path, so it must not resolve here.
+    veh = conn.execute("SELECT * FROM identities WHERE id=? AND kind='plate'",
+                       (int(identity_id),)).fetchone()
     if veh is None:
         return None
-    rows = conn.execute(_SIGHTINGS_SQL, (int(vehicle_id),)).fetchall()
+    rows = conn.execute(_SIGHTINGS_SQL, (int(identity_id),)).fetchall()
     sightings = [Sighting(r) for r in rows]
 
     # 1. Gather. Set aside anything with no comparable clock, and keep it: a
@@ -355,7 +358,7 @@ def build_path(conn, vehicle_id: int, max_gap_s: float = MAX_GAP_S,
     conflicts, overlaps = find_conflicts(visits)
     journeys = [Journey(group, max_speed_kmh, overlaps)
                 for group in split(visits, max_gap_s)]
-    return VehiclePath(vehicle_id=veh["id"], plate=veh["plate"],
+    return VehiclePath(identity_id=veh["id"], plate=veh["key"],
                        journeys=journeys, unorderable=unorderable,
                        conflicts=conflicts, total_sightings=len(sightings))
 
@@ -423,11 +426,13 @@ def multi_camera_vehicles(conn, min_cameras: int = 2) -> list:
     """
     conn.row_factory = sqlite3.Row
     return conn.execute(
-        "SELECT o.vehicle_id, COUNT(DISTINCT r.camera) cams, COUNT(*) sightings,"
-        "       (SELECT plate FROM vehicles v WHERE v.id = o.vehicle_id) plate"
+        "SELECT o.identity_id, COUNT(DISTINCT r.camera) cams,"
+        "       COUNT(*) sightings,"
+        "       (SELECT key FROM identities v WHERE v.id = o.identity_id) plate"
         " FROM objects o JOIN runs r ON r.id = o.run_id"
-        " WHERE o.vehicle_id IS NOT NULL"
-        " GROUP BY o.vehicle_id HAVING cams >= ?"
+        " WHERE o.identity_id IS NOT NULL"
+        "   AND o.identity_id IN (SELECT id FROM identities WHERE kind='plate')"
+        " GROUP BY o.identity_id HAVING cams >= ?"
         " ORDER BY cams DESC, sightings DESC", (int(min_cameras),)).fetchall()
 
 
@@ -441,7 +446,8 @@ def yield_summary(conn) -> dict:
     different work.
     """
     conn.row_factory = sqlite3.Row
-    total = conn.execute("SELECT COUNT(*) n FROM vehicles").fetchone()["n"]
+    total = conn.execute("SELECT COUNT(*) n FROM identities"
+                         " WHERE kind='plate'").fetchone()["n"]
     multi = multi_camera_vehicles(conn)
     cams = conn.execute("SELECT COUNT(DISTINCT camera) n FROM runs").fetchone()["n"]
     unanchored = conn.execute(

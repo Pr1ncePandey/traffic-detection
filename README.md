@@ -45,7 +45,7 @@ important thing to understand about the output.
 | | what it is | scope | where |
 |---|---|---|---|
 | **track id** | one *sighting* | inside one run | `objects.track_id` |
-| **vehicle id** | one *car* | across runs **and cameras** | `vehicles.id`, referenced by `objects.vehicle_id` |
+| **identity** | one *entity* | across runs **and cameras** | `identities.id` (`kind='plate'` for a car), referenced by `objects.identity_id` |
 
 **Why two.** ByteTrack cannot re-assign a previous id to a reappearing object.
 It matches on Kalman-predicted motion and IoU overlap only (`match_thresh:
@@ -56,16 +56,16 @@ that gets a **fresh, higher id**. Ids are never recycled.
 So the track id alone over-counts real vehicles. The number plate is the only
 identity this system reads that survives an absence, and it is now used as the
 key: `reid:` in `config.yaml` resolves a plate to a stable **vehicle id**, held
-in the `vehicles` table. A car that leaves and comes back gets its original
+in the `identities` table. A car that leaves and comes back gets its original
 vehicle id back — on the annotated video it is labelled `V7`, not a new `#31` —
 and so does the same car tomorrow, or on a different camera writing to the same
 database.
 
 **Each sighting still gets its own `objects` row.** That is deliberate: a
 vehicle that genuinely passes twice really did pass twice, so throughput
-counting (`A->B` / `B->A`) is unaffected by re-identification. `vehicle_id` is
+counting (`A->B` / `B->A`) is unaffected by re-identification. `identity_id` is
 what ties the sightings together. How many times a car was seen is
-`SELECT COUNT(*) FROM objects WHERE vehicle_id = ?`.
+`SELECT COUNT(*) FROM objects WHERE identity_id = ?`.
 
 ```bash
 python query.py --vehicle 7              # every sighting of one car
@@ -75,7 +75,7 @@ python query.py --plate HR26DK8337       # same, found by plate
 ### The honest limits
 
 - **No readable plate means no durable identity.** Too far, occluded, night,
-  or a two-wheeler whose plate never resolves: `vehicle_id` stays `NULL` and
+  or a two-wheeler whose plate never resolves: `identity_id` stays `NULL` and
   those sightings are not linked to each other. They are not guessed at. The
   report counts them in "Distinct track IDs" and not in "Distinct vehicles".
 - **Binding is deliberately conservative.** A plate must clear
@@ -111,7 +111,7 @@ obstacle detector. Naming arbitrary road objects needs an open-vocabulary model
 ## Input sources and analysis rate
 
 ```bash
-python main.py --source samples/input.mp4          # file
+python main.py --source samples/short/input.mp4    # file
 python main.py --source rtsp://cam/stream          # live stream
 python main.py --source 0                          # webcam index
 python main.py --source rtsp://cam/stream --analyse-fps 5
@@ -142,20 +142,20 @@ nothing depends on the process exiting cleanly.
 |---|---|---|
 | `runs` | run | source, geometry, analyse_fps, full config JSON |
 | `frames` | analysed frame | `raw_path` + `annotated_path`, or segment + offset |
-| `objects` | **one sighting** | class, group, first/last seen, best conf, crop path, lane, `vehicle_id` |
-| `vehicles` | **one car** | plate (UNIQUE), first/last seen across every run — the durable identity |
+| `objects` | **one sighting** | class, group, first/last seen, best conf, crop path, lane, `identity_id` |
+| `identities` | **one entity** | `kind` + `key` (UNIQUE together), first/last seen across every run — the durable, class-agnostic identity |
 | `detections` | object per frame | box, conf, crossing event, lane flag |
 | `attributes` | object + key | **tall**: `('plate_number', 'HR26AF7196', 0.94)` |
-| `events` | notable moment | crossing, wrong_way, plate_read, vehicle_identified, congestion |
+| `events` | notable moment | crossing, wrong_way, plate_read, identity_bound, congestion |
 
 `attributes` is deliberately tall rather than wide columns: adding colour, brand
 or speed later needs no migration, and the `(key, value)` index keeps plate
 lookup fast.
 
-`objects.vehicle_id` is what makes a re-entering car one car — see
+`objects.identity_id` is what makes a re-entering car one car — see
 [Identity](#identity-sightings-vs-vehicles). It is `NULL` when no plate was
-read confidently. There is deliberately **no** sightings counter on `vehicles`:
-the count is `COUNT(*)` over `objects.vehicle_id`, which cannot drift from the
+read confidently. There is deliberately **no** sightings counter on `identities`:
+the count is `COUNT(*)` over `objects.identity_id`, which cannot drift from the
 rows it claims to count.
 
 ```sql
@@ -165,7 +165,7 @@ SELECT cls_group, cls_name, COUNT(*) FROM objects GROUP BY 1,2 ORDER BY 3 DESC;
 SELECT object_id, value, conf FROM attributes WHERE key='plate_number';
 -- cars that left and came back: one vehicle, several sightings
 SELECT v.id, v.plate, COUNT(o.id) sightings
-  FROM vehicles v JOIN objects o ON o.vehicle_id=v.id
+  FROM identities v JOIN objects o ON o.identity_id=v.id
   GROUP BY v.id HAVING COUNT(o.id) > 1 ORDER BY sightings DESC;
 -- an object with its frames
 SELECT f.frame_no, f.raw_path, d.conf FROM detections d
@@ -286,7 +286,7 @@ lanes_mode: "auto"        # measure the geometry from motion (default)
 ```
 
 **The geometry is measured or checked, never just asserted.** It used to be a
-pair of polygons hand-tuned on `samples/input.mp4` and inherited unchecked by
+pair of polygons hand-tuned on `samples/short/input.mp4` and inherited unchecked by
 every other source. On Indian test footage that divider cut diagonally
 through the middle of a single one-way carriageway: 2 of 90 vehicle tracks were
 reported wrong-way, **both driving correctly, 0 real offenders**. So during a
@@ -348,8 +348,8 @@ Indian-format correction and a plate-ish gate. Swap the reader with
 
 | backend | install | CER | ms/plate | what it is |
 |---|---|---|---|---|
-| `paddle_anpr` **(default)** | see below | **0.19** | 50 | PP-OCRv5 finetuned on 558k Indian plates; reads two-row (bike) plates. |
-| `fast_plate` | in `requirements.txt` | 0.54 | 8 | Plate-specialised CCT model, ~5MB ONNX. |
+| `fast_plate` **(default)** | in `requirements.txt` | 0.54 | 8 | Plate-specialised CCT model, ~5MB ONNX. |
+| `paddle_anpr` | see below | **0.19** | 50 | PP-OCRv5 finetuned on 558k Indian plates; reads two-row (bike) plates. More accurate, but `pip` cannot install it. |
 | `rapidocr` | in `requirements.txt` | 0.88 | 370 | Generic scene-text OCR, **not** plate-specialised. Fallback only. |
 
 CER = character error rate, lower is better, measured on `samples/plate_gt.csv`
@@ -357,6 +357,15 @@ CER = character error rate, lower is better, measured on `samples/plate_gt.csv`
 earlier Indian clip, since replaced by `samples/indian_road.mp4`). Only this
 column is comparable — the vendors' published figures come from different datasets. n=5 is
 thin: treat the ordering as solid and the values as indicative.
+
+**The default is deliberately not the most accurate one.** `paddle_anpr` was
+the default and cannot be installed by `pip install -r requirements.txt`, so out
+of the box it failed to load and no plates were read at all. Via `main.py` that
+at least printed a reason; on the dashboard it surfaced as an empty plate column
+with no explanation, which is the worst of both. So the default is now the
+backend that works everywhere, and `paddle_anpr` is the upgrade. `/cameras`
+reports which backend actually loaded, and the dashboard shows a banner naming
+the failure when one did not.
 
 `paddle_anpr` needs weights and a PaddleOCR checkout:
 
@@ -401,9 +410,9 @@ pixels on a front-on plate is the single biggest remaining win.
 
 ## Multi-camera journeys
 
-Where did one car go? `objects.vehicle_id` is already fleet-global — one
+Where did one car go? `objects.identity_id` is already fleet-global — one
 database serves every camera and `vehicles.plate` is `NOT NULL UNIQUE` — so a
-journey is structurally `objects WHERE vehicle_id = ?` ordered by time and
+journey is structurally `objects WHERE identity_id = ?` ordered by time and
 joined to `runs`. Two things had to be fixed first.
 
 **Time had to become comparable.** The pipeline writes two incompatible kinds of
@@ -485,9 +494,7 @@ to copy to a real camera. The best plate read on this clip scores 0.53, under
 the 0.7 fleet default, so at the default exactly **one** vehicle binds and you
 see one hop rather than three. The default is higher than `plate.min_conf` on
 purpose — a read good enough to print on a box is not good enough to merge two
-vehicles' histories on, and a wrong merge is permanent. `--ocr-backend
-fast_plate` is needed because the default `paddle_anpr` is not installed by
-`requirements.txt`.
+vehicles' histories on, and a wrong merge is permanent.
 
 ```
 Vehicle V1  plate KA01AB1234
@@ -539,16 +546,26 @@ writer threads on one SQLite file.
 | `GET /cameras/{id}` | detail: fps, queue depth, drops, counts |
 | `POST /cameras/{id}/start`, `/stop` | control plane |
 | `GET /incidents`, `/deliveries` | the outbox and its delivery state |
-| `GET /vehicles/{id}`, `/vehicles/{id}/path` | sightings, and journeys |
+| `GET /events` | the raw event log, filterable by kind |
+| `GET /search?q=` | open-vocabulary search over embedded crops |
+| `GET /objects`, `/objects/{id}` | browse the object record, with attributes |
+| `GET /identities` | durable identities plus sighting counts (`?kind=plate`) |
+| `GET /identities/{id}`, `/identities/{id}/path` | sightings, and journeys |
+| `GET /vocabulary` | cameras / classes / groups / attribute values |
 | `GET /yield` | the cross-camera measurement above |
 | `GET /crops/{object_id}.jpg` | serves `objects.crop_path` |
+| `GET /stream/{camera_id}.mjpg` | live MJPEG video |
+| `GET /snapshot/{camera_id}.jpg` | the latest frame, once |
 | `WS /live/{camera_id}` | frame metadata stream |
 
 **There is no application-level authentication.** The service is protected by
 network placement only, so it binds to `127.0.0.1` by default and `--host
-0.0.0.0` prints a warning. That default matters: `/crops` serves number-plate
-imagery and `/live` streams plate strings, so exposing this on an untrusted
-network publishes both. Put it behind a VPN or an authenticating proxy first.
+0.0.0.0` prints a warning. That default matters, and it matters more now the
+dashboard shows video: `/crops` serves number-plate imagery, `/live` streams
+plate strings, and `/stream` serves live road footage, so exposing this on an
+untrusted network publishes all three. Put it behind a VPN or an authenticating
+proxy first. `server.video.enabled: false` turns off the stream alone and
+leaves the rest of the dashboard working, if that is the trade you want.
 
 **On the GIL, honestly.** N camera threads only parallelise where the heavy work
 releases it. OpenCV and onnxruntime do for their compute kernels, so decode and
@@ -559,17 +576,118 @@ it on your host rather than trust a promised number.
 
 ### Live dashboard
 
-Metadata over WebSocket, drawn client-side — not video. About 30 boxes at ~120
-bytes is ~4 KB per message, and the hub pushes at a fixed ~8 Hz however fast the
-pipeline runs, so a viewer costs ~32 KB/s. Nobody can read 30 updates a second
-and a file replaying at 3× real time would otherwise flood the socket. A slow
-browser tab **drops frames rather than applying backpressure**: it must not be
-able to slow a camera.
+Six views at <http://127.0.0.1:8000/> — live, search, objects, vehicles,
+incidents, system. Press `1`–`6` to switch, `c` to cycle camera, `f` for
+fullscreen, `/` to search.
+
+**Two channels, stacked.** The picture is an MJPEG stream of the *clean* frame;
+the boxes are drawn on a canvas over it from the metadata WebSocket. Keeping
+boxes as data rather than letting OpenCV burn them into the JPEG is what makes
+them toggleable, filterable and clickable — the toolbar can hide labels, show
+attributes, draw trails, or show only flagged objects, none of which is
+possible once a box is pixels.
+
+That the two line up is not luck. The canvas is sized to the camera's **source**
+resolution while both elements are stretched to the same box by CSS, so the
+encoder has to preserve aspect ratio when it downscales; a fixed output size
+would put every box a few pixels off its object and look like a tracking bug.
+
+| | cost per viewer | knob |
+|---|---|---|
+| metadata (boxes, health) | ~4 KB/msg for vehicles, ~8 KB with person attributes → ~32–64 KB/s at 8 Hz | `server.push_hz` |
+| video | ~83 KB/frame → **~4.3 Mbit/s** at 8 fps, measured on `samples/short/indian_road.mp4` (1080p, busy) | `server.video.{fps,quality,max_width}` |
+
+A quiet scene costs far less — JPEG size follows detail. **Encoding is skipped
+when nobody is watching**, dropping to `snapshot_fps` (1 Hz) so `/snapshot.jpg`
+stays useful for thumbnails.
+
+**Watching a camera does cost it something, measured.** On one 1080p camera on
+this host: ~10.1 fps with no viewers (1 encode/s) against ~9.2 fps with three
+(~5 encodes/s) — roughly 10%. Encoding itself is only 1.1 ms a frame, so most
+of that is the GIL contention of three concurrent HTTP streams rather than the
+JPEG work, and it is the same non-linearity that makes per-camera throughput
+fall as camera count rises. If you need the frame rate, turn video off or drop
+`fps`; don't assume viewers are free.
+
+Slow clients on either channel **drop frames rather than applying
+backpressure**: a stalled browser tab must not be able to slow a camera.
+
+Set `server.video.enabled: false` for the original metadata-only dashboard.
+Everything else keeps working and `/stream` returns 503.
 
 The health tiles are as much the point as the boxes: fps, write-queue depth,
 shed rows, lost rows, writer alarm, dropped frames, wrong-way and congestion
 totals. A camera that is silently dead is the failure mode this layer exists to
 make visible.
+
+**The index maintains itself.** Embeddings are not built by the pipeline - no
+real-time decision needs one, and keeping CLIP out of `pipeline.py` makes a
+model swap a script re-run. That used to mean search silently returned nothing
+on a fresh database, and silently covered part of the corpus on an old one,
+until somebody remembered `tools/embed_crops.py`. So the service embeds its own
+backlog on a thread, alongside the webhook dispatcher and the retention reaper.
+The frame loop is untouched.
+
+It runs on a **duty cycle**, because L/14 inference is ~317 ms/crop and the
+cameras want that CPU: `batch` crops, then a deliberate `pause_s`. The defaults
+(8, 3.0 s) come to ~45%, about 1.4 crops/s against the CLI's 3.1 - slower on
+purpose, since a backlog nobody is waiting on must not cost the live feeds
+frame rate. `server.search.pause_s: 0` runs flat out;
+`embed_in_background: false` goes back to embedding by hand.
+
+Coverage is on screen and in the log rather than something to discover by
+searching. Startup prints it:
+
+```
+[server] search index: 434 of 1980 crops embedded in clip-vit-l14,
+         1546 without vectors - the background embedder is working through them
+```
+
+and the search view carries `indexed / coverage % / no vectors / space /
+embedder state` tiles, so a **partial** index — the genuinely dangerous state,
+where results look fine and 60% of the corpus was never indexed — says so.
+
+`server.search.model` is the one place the embedding space is named. It used to
+be a constant in the server while `tools/embed_crops.py` defaulted to a
+different space, so running the embedder with no flags filled an index nothing
+queried and search stayed empty with no error. Cosine is only meaningful within
+one space, so two indexes can never cover for each other. The eligibility rules
+(`min_px`, `min_conf`, `max_area`) live in `src/query/embed.py` and are shared
+by the CLI and the service, so the two cannot build to different standards.
+
+**Search, and what it does not claim.** The search view ranks embedded crops by
+similarity to free text. It reports "the nearest N of M candidates" and never
+"found X", because measurement found no similarity floor separating present
+concepts from absent ones — so the top hit is the closest crop whether or not
+the thing you asked for is in the footage. The UI carries that framing, the
+candidate count and the score spread on every result, and surfaces the
+router's advisory when an exact SQL answer would be cheaper. Embed first with
+`python tools/embed_crops.py`; without it the view says so.
+
+The rest of the honest limits are on screen too, for the same reason they are
+in this README: journeys draw unobserved stretches as gaps and list sightings
+they cannot order rather than silently sequencing them, an empty flagged-object
+list explains that `no-data` lanes are unverified rather than clean, and a crop
+that retention reaped renders differently from one that never existed.
+
+**Empty is not the same as broken, and the dashboard has to say which.** Two
+cases earned dedicated messages because both first appeared as a blank panel
+with no explanation:
+
+- **An empty plate column.** Ambiguous between "no plate was readable in this
+  frame" — normal, constantly — and "the OCR backend never loaded", a setup
+  problem that will not fix itself. `/cameras` reports `plate_ocr`
+  (`{backend, ok, error}`), the column reads `reader off` rather than `–` when
+  a backend failed, and the live view banners the reason with the fix. Note it
+  stays silent until a backend is actually attempted: the engine initialises on
+  the first frame carrying a plate box, so there is legitimately nothing to
+  report in the first seconds of a run.
+- **An empty search.** Almost always an unindexed model rather than a query
+  with no matches, so the response carries `indexed_models` and the view
+  distinguishes "nothing is embedded" from "*this* space is empty while the
+  other has 1,450 vectors" — the second is a dropdown away from working, and
+  calling it unindexed would be false. Cosine is only meaningful within one
+  embedding space, so the two indexes can never be merged to paper over it.
 
 ### Incident webhooks
 
@@ -579,7 +697,7 @@ make visible.
 | `congestion` | yes, on state change | see below |
 | `wrong_lane` | configurable | noisier; depends on lane confidence |
 | `crossing` | **no** | fires for every vehicle. A counter, not an incident |
-| `vehicle_identified` | no | internal bookkeeping; fires on every rebind |
+| `identity_bound` | no | internal bookkeeping; fires on every rebind |
 
 Per-vehicle incidents fire **once, at track retirement** — the only moment the
 payload is complete, because that is when the plate vote has settled and the
@@ -601,7 +719,7 @@ Three rules exist because the simple version is wrong:
   `congestion_dwell_s`; a metric sitting on its threshold would otherwise emit
   hundreds of webhooks a minute. Both edges are emitted so a consumer can show
   current state and compute a jam's duration from the pair.
-- **Absence is explicit.** `plate` and `vehicle_id` may be `null`, because a
+- **Absence is explicit.** `plate` and `identity_id` may be `null`, because a
   vehicle whose plate never read confidently has no `vehicles` row at all. The
   keys are present with null values rather than omitted.
 
@@ -665,16 +783,21 @@ python report.py
 python query.py --list
 ```
 
-That gives you detection, tracking, counting, lanes, colour and congestion.
-It does **not** give you plates: `plate.ocr_backend` defaults to `paddle_anpr`,
-which needs the extra setup below, so the run prints `[plate] paddle_anpr
-unavailable: PaddleOCR checkout not found` and reads no plates — and therefore
-does no plate-keyed re-identification either. For plates without that setup,
-use a backend `requirements.txt` does install:
+That gives you detection, tracking, counting, lanes, colour, congestion **and
+plates** — `plate.ocr_backend` defaults to `fast_plate`, which
+`requirements.txt` installs, so plate reading and plate-keyed re-identification
+work on a clean clone. On `samples/short/indian_road.mp4` that reads 8 plates
+across 195 tracks and binds one vehicle.
+
+For better characters (CER 0.19 vs 0.54), install `paddle_anpr` per the section
+above and switch to it:
 
 ```bash
-python main.py --ocr-backend fast_plate     # CER 0.54 vs paddle_anpr's 0.19
+python main.py --ocr-backend paddle_anpr
 ```
+
+Whichever you pick, the run prints which backend loaded — `[plate] OCR backend:
+fast_plate` — or why it did not.
 
 Windows (PowerShell), same idea — keep the venv **outside** the project folder
 so it never gets zipped or pushed (venvs are machine-specific and gigabytes):
@@ -746,15 +869,27 @@ src/storage/     SQLite backend, frame writers, retention:
                    sqlite_store.py     one writer thread, the outbox tables
                    frames.py           frame writers + the frame reaper
                    retention.py        crop pinning and row caps
+src/query/       open-vocabulary search:
+                   clip_onnx.py        both CLIP towers, loaded lazily
+                   embed.py            crop eligibility + batching, SHARED by
+                                       tools/embed_crops.py and the server
+                   router.py           scope-vs-subject split; never rewrites
+                                       the subject
+                   search.py           SQL prefilter -> numpy dot-product rerank
 src/timebase.py  epoch vs clip-seconds - the only reader of runs.time_base
 src/journeys.py  multi-camera route assembly (offline, read-only)
 src/incidents.py incident POLICY: what fires, when, and the payload
 src/server/      the long-running service:
                    app.py              FastAPI endpoints + WebSocket
                    workers.py          one supervised thread per camera
-                   hub.py              live fan-out, throttled, drops for slow
+                   hub.py              metadata fan-out, throttled, drops slow
+                   video.py            MJPEG fan-out, same rules, skips idle
+                   embedder.py         keeps the search index current, on a
+                                       duty cycle so cameras keep their CPU
+                   queries.py          the read side: search, browse, vocabulary
                    webhooks.py         outbox DELIVERY: retry, dead-letter
-                   dashboard.py        the single-page UI
+                   dashboard.py        where static/ lives, and why
+                   static/             index.html + app.css + app.js, no build
 src/pipeline.py  orchestrator (owns the loop, knows no individual use case)
 main.py          one camera, one shot
 serve.py         every camera, continuously
@@ -771,7 +906,7 @@ service with a live dashboard, incident webhooks and disk/row retention.
 
 Known limits, stated plainly:
 - COCO cannot name potholes, debris, cones or barriers (see above).
-- Track ids count sightings and over-count real objects; `vehicle_id`
+- Track ids count sightings and over-count real objects; `identity_id`
   (plate-keyed) is the durable identity, and is NULL when no plate was read.
 - Re-identification needs an EXACT plate match, so it is capped by OCR
   accuracy, not by the matching logic. On the sample clips `paddle_anpr`

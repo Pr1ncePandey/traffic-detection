@@ -1,7 +1,19 @@
-"""Per-vehicle memory: lifetime, crossings, attribute dict that grows.
+"""Per-TRACK memory: lifetime, crossings, attribute dict that grows.
 
-Future attributes (plate, color, brand) plug in here as functions that fill
-vehicle['attrs'][name]. Search ("red Maruti") reads this dict later.
+One entry per tracked object of ANY class - car, person, dog - keyed by track
+id, with `cls_group` telling them apart exactly as objects.cls_group does in
+the database. It was called `vehicles` and documented as per-vehicle memory,
+which was false the whole time: pipeline.py calls touch() for every tracked
+detection with no class filter, and the person enrichers (person, garments,
+age_gender) have always written here. The name also collided with the
+`identities` table's former name.
+
+Attributes plug in as enrichers that fill track['attrs'][name]; search
+("red Maruti", "man with a backpack") reads this dict later. `attrs` starts
+EMPTY on purpose - it used to be seeded with plate_number/plate_conf/color/
+brand, so every pedestrian carried four vehicle-only fields. They stayed out
+of the database only because _finalize skips empty values; one non-empty
+default would have written plate_number='...' rows onto people.
 """
 
 from collections import defaultdict
@@ -21,7 +33,7 @@ def ttl_for(fps: float, track_buffer: int = 30) -> float:
 
 class TrackStore:
     def __init__(self):
-        self.vehicles = {}          # tid -> {vehicle_class, first_seen_s, last_seen_s, frames_seen, attrs{}}
+        self.tracks = {}            # tid -> {cls_name, cls_group, first_seen_s, last_seen_s, frames_seen, attrs{}}
         self.prev_y = {}            # tid -> previous centroid y (for legacy single-line crossing)
         self.prev_xy = {}           # tid -> (prev_cx, prev_cy) for lane direction vectors
         self.in_count = 0
@@ -39,14 +51,14 @@ class TrackStore:
         self.wrong_way_ids = set()
         self.wrong_lane_ids = set()
         self.object_ids = {}        # tid -> storage object id (survives in the DB)
-        # Durable identity. vehicle_of is the answer to "is this the same car
+        # Durable identity. identity_of is the answer to "is this the same car
         # as before"; plate_of remembers which plate string produced it, so a
         # consensus that changes as more frames are voted triggers a rebind
         # instead of silently keeping the first guess. See trackers/identity.py.
-        self.vehicle_of = {}        # tid -> vehicle id (plate-keyed, cross-run)
+        self.identity_of = {}       # tid -> identities.id (cross-run)
         self.plate_of = {}          # tid -> plate string that was bound
         self.evicted = 0           # tracks retired by evict_stale
-        # Cumulative, incremented once per track on first sight. self.vehicles
+        # Cumulative, incremented once per track on first sight. self.tracks
         # cannot be used for totals because evict_stale removes from it.
         self.class_totals = defaultdict(int)
 
@@ -111,17 +123,18 @@ class TrackStore:
         if "wrong_lane" in flag:
             self.wrong_lane_ids.add(tid)
 
-    def touch(self, tid: int, vclass: str, timestamp: float,
+    def touch(self, tid: int, cls_name: str, timestamp: float,
               group: str = "", conf: float = 0.0):
-        v = self.vehicles.get(tid)
+        v = self.tracks.get(tid)
         if v is None:
-            self.class_totals[vclass] += 1
-            self.vehicles[tid] = {"vehicle_class": vclass, "cls_group": group,
-                                  "first_seen_s": round(timestamp, 2),
-                                  "last_seen_s": round(timestamp, 2), "frames_seen": 1,
-                                  "best_conf": round(float(conf), 3),
-                                  "attrs": {"plate_number": "", "plate_conf": 0.0,
-                                            "color": "", "brand": ""}}
+            self.class_totals[cls_name] += 1
+            # attrs is EMPTY: each enricher owns its own keys. See the module
+            # docstring for why the old vehicle-only seed was wrong.
+            self.tracks[tid] = {"cls_name": cls_name, "cls_group": group,
+                                "first_seen_s": round(timestamp, 2),
+                                "last_seen_s": round(timestamp, 2), "frames_seen": 1,
+                                "best_conf": round(float(conf), 3),
+                                "attrs": {}}
         else:
             v["last_seen_s"] = round(timestamp, 2)
             v["frames_seen"] += 1
@@ -142,26 +155,26 @@ class TrackStore:
         converted to seconds, or we would evict a track the tracker can still
         revive - the caller computes that, see ttl_for().
 
-        on_evict(tid, vehicle) is called BEFORE the state is dropped, so the
+        on_evict(tid, track) is called BEFORE the state is dropped, so the
         final object row and voted plate can be persisted. Anything it raises
         is swallowed: a storage hiccup must not abort the sweep and leak.
         """
-        stale = [tid for tid, v in self.vehicles.items()
+        stale = [tid for tid, v in self.tracks.items()
                  if (now_s - v.get("last_seen_s", 0.0)) > ttl_s]
         for tid in stale:
-            vehicle = self.vehicles.get(tid)
-            if on_evict is not None and vehicle is not None:
+            track = self.tracks.get(tid)
+            if on_evict is not None and track is not None:
                 try:
-                    on_evict(tid, vehicle)
+                    on_evict(tid, track)
                 except Exception as e:
                     print(f"[store] evict handler failed for track {tid}: {e}")
-            self.vehicles.pop(tid, None)
+            self.tracks.pop(tid, None)
             self.prev_y.pop(tid, None)
             self.prev_xy.pop(tid, None)
             self.lane_of.pop(tid, None)
             self.lane_flag_of.pop(tid, None)
             self.object_ids.pop(tid, None)
-            self.vehicle_of.pop(tid, None)
+            self.identity_of.pop(tid, None)
             self.plate_of.pop(tid, None)
             self.saved_crops.discard(tid)
             self._seen_below.discard(tid)
@@ -179,9 +192,9 @@ class TrackStore:
 
     def state_size(self) -> int:
         """Total tracked entries - used to assert memory really is bounded."""
-        return (len(self.vehicles) + len(self.prev_y) + len(self.prev_xy)
+        return (len(self.tracks) + len(self.prev_y) + len(self.prev_xy)
                 + len(self.lane_of) + len(self.lane_flag_of) + len(self.object_ids)
-                + len(self.vehicle_of) + len(self.plate_of)
+                + len(self.identity_of) + len(self.plate_of)
                 + len(self.saved_crops) + len(self._seen_below) + len(self._seen_above)
                 + len(self._counted) + len(self._lane_seen)
                 + len(self.wrong_way_ids) + len(self.wrong_lane_ids))

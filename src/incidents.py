@@ -10,7 +10,7 @@ WHAT COUNTS
     wrong_lane           configurable   noisier; depends on lane confidence
     crossing             NO             fires for every vehicle. It is a
                                         counter, not an incident
-    vehicle_identified   no             internal bookkeeping; fires on every
+    identity_bound       no             internal bookkeeping; fires on every
                                         mid-track rebind
 
 The enable flags live in config (`incidents.kinds`), so this is policy an
@@ -43,7 +43,7 @@ THREE RULES THAT EXIST BECAUSE THE SIMPLE VERSION IS WRONG
    consumer can show a current state and compute a jam's duration from the
    pair - onset-only can do neither.
 
-3. Absence is explicit. `plate` and `vehicle_id` may be null, because a vehicle
+3. Absence is explicit. `plate` and `identity_id` may be null, because a vehicle
    whose plate never read confidently has no `vehicles` row at all. The payload
    carries the keys with null values rather than omitting them, so a consumer
    can tell "no plate" from "this version does not send plates".
@@ -59,7 +59,7 @@ import time
 # than merely left out of the defaults so the reason survives.
 NEVER = {
     "crossing": "fires for every vehicle - a counter, not an incident",
-    "vehicle_identified": "internal bookkeeping; fires on every mid-track rebind",
+    "identity_bound": "internal bookkeeping; fires on every mid-track rebind",
     "track_retired": "the trigger for other incidents, not one itself",
     "color_read": "an attribute enricher reporting a fact",
     "clothes_read": "an attribute enricher reporting a fact",
@@ -71,7 +71,8 @@ DEFAULT_KINDS = {"wrong_way": True, "congestion": True,
 # Kept out of the payload's `detail` block: either projected into a dedicated
 # block already, or a local path a remote consumer cannot use.
 _DETAIL_STRIP = frozenset({
-    "object_id", "vehicle_id", "plate", "plate_conf", "cls_name", "colour",
+    "object_id", "identity_id", "identity_kind", "plate", "plate_conf",
+    "cls_name", "colour",
     "first_seen_s", "last_seen_s", "frames_seen", "crop_path",
 })
 
@@ -284,14 +285,14 @@ class IncidentPolicy:
                 continue
             self._fired.add(key)
             payload = self._payload(
-                kind, camera, detail.get("object_id"), detail.get("vehicle_id"),
+                kind, camera, detail.get("object_id"), detail.get("identity_id"),
                 evidence=self._evidence.get(key) or {"lane_id": detail.get("lane_id"),
                                                      "lane_flag": flag},
                 sighting=detail,
                 detected_at=float(detail.get("last_seen_s") or 0.0),
                 state="closed")
             out.append(self._raise(kind, camera, detail.get("object_id"),
-                                   detail.get("vehicle_id"), payload,
+                                   detail.get("identity_id"), payload,
                                    created_at=time.time()))
         self._forget(camera, tid)
         return out
@@ -350,7 +351,7 @@ class IncidentPolicy:
         return (self._congestion.get(camera) or {}).get("published", CLEAR)
 
     # --- payload -----------------------------------------------------------
-    def _payload(self, kind, camera, object_id, vehicle_id, evidence, sighting,
+    def _payload(self, kind, camera, object_id, identity_id, evidence, sighting,
                  detected_at, state="closed", dwell_s=None) -> dict:
         """The JSON body. Keys are present even when their value is null.
 
@@ -382,8 +383,16 @@ class IncidentPolicy:
             body["dwell_s"] = round(float(dwell_s), 2)
         if kind != "congestion":
             sighting = sighting or {}
+            # Block still named `vehicle`: it carries plate/colour/cls, and
+            # every incident kind today is a vehicle or scene concern. A person
+            # subject needs DIFFERENT fields, not this block relabelled, so it
+            # is left until a person incident kind actually exists.
+            # identity_kind is what tells a consumer which axis identity_id is
+            # on - without it, "42" cannot be distinguished from a person's
+            # appearance cluster once identities.kind has a second value.
             body["vehicle"] = {
-                "vehicle_id": vehicle_id,
+                "identity_id": identity_id,
+                "identity_kind": sighting.get("identity_kind"),
                 "plate": sighting.get("plate"),
                 "plate_conf": sighting.get("plate_conf"),
                 "cls": sighting.get("cls_name") or None,
@@ -406,10 +415,10 @@ class IncidentPolicy:
                 else None)
         return body
 
-    def _raise(self, kind, camera, object_id, vehicle_id, payload,
+    def _raise(self, kind, camera, object_id, identity_id, payload,
                created_at, id_stamp=None) -> dict:
         incident = {"id": payload["incident_id"], "camera": camera, "kind": kind,
-                    "object_id": object_id, "vehicle_id": vehicle_id,
+                    "object_id": object_id, "identity_id": identity_id,
                     "payload": payload, "created_at": created_at}
         endpoints = self.endpoints_for(kind, camera)
         if self.store is not None:

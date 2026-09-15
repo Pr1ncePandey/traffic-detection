@@ -1,0 +1,37 @@
+# Person-heavy test clip, used to re-run the vector-search Layer 0 / Layer 4a
+# measurements on footage that is not dense vehicle traffic.
+#
+# NO geometry is calibrated for this camera: there is no counting line and no
+# lane polygon, because the clip is a pedestrian scene rather than a
+# carriageway. `lanes` and `counting` are therefore OFF - not because they
+# fail, but because a verdict from uncalibrated geometry would be invented.
+# Crops and attributes (which is what the vector-search work measures) are
+# unaffected by either.
+
+camera:
+  name: "person_test"
+
+video:
+  source: "samples/long/person_test_long.mp4"
+
+analyses:
+  lanes:
+    enabled: false
+  counting:
+    enabled: false
+  congestion:
+    enabled: false
+
+perception:
+  attributes:
+    person:
+      # `holding` (HoldObjectsInFront) added to the fleet default list. It is
+      # off globally because it was not field-verified, and it is wanted HERE
+      # because `holding` and `bag` are the only labels this project produces
+      # for a RELATIONAL concept - "a person carrying something" - which is
+      # exactly the query shape open-vocabulary search exists to answer, and
+      # which no other extractor covers.
+      #
+      # Treated as a NOISY label, not truth. It caps measured precision the
+      # same way the HSV colour labels do, and must be reported that way.
+      keys: [facing, sleeves, lower, bag, hat, glasses, holding]

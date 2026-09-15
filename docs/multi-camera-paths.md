@@ -22,7 +22,7 @@ rewrite.
 `cameras/<id>.yaml` may not override (`src/config.py:26`). One database serves
 every camera, so `vehicles.plate NOT NULL UNIQUE`
 (`src/storage/sqlite_store.py:63`) is a global key: camera A and camera B
-resolving the same plate arrive at the same `vehicle_id` through
+resolving the same plate arrive at the same `identity_id` through
 `PlateIdentity.resolve()`, with no cross-camera code involved.
 
 **Sightings are already queryable across cameras.** `query.py --vehicle N`
@@ -32,7 +32,7 @@ docstring, line 16).
 **Camera attribution exists**, via `objects.run_id -> runs.camera`
 (`src/storage/sqlite_store.py:34`).
 
-So a journey is, structurally, `objects WHERE vehicle_id = ?` ordered by time
+So a journey is, structurally, `objects WHERE identity_id = ?` ordered by time
 and joined to `runs`. The data model does not have to change shape — but two
 of those three ingredients have a defect that this feature exposes.
 
@@ -112,10 +112,10 @@ Before building anything. Run two cameras over footage containing genuinely
 shared vehicles, then count vehicles seen by more than one camera:
 
 ```sql
-SELECT o.vehicle_id, COUNT(DISTINCT r.camera) cams, COUNT(*) sightings
+SELECT o.identity_id, COUNT(DISTINCT r.camera) cams, COUNT(*) sightings
 FROM objects o JOIN runs r ON r.id = o.run_id
-WHERE o.vehicle_id IS NOT NULL
-GROUP BY o.vehicle_id HAVING cams > 1;
+WHERE o.identity_id IS NOT NULL
+GROUP BY o.identity_id HAVING cams > 1;
 ```
 
 Zero rows means the layers below would be scaffolding around an empty set, and
@@ -144,7 +144,7 @@ absolute_time(run_row, secs) -> float | None
 the journey query must set those sightings aside and say so, not guess at them.
 
 **Migration.** `_check_schema` (`src/storage/sqlite_store.py:204`) already
-hard-errors on a database predating `vehicle_id`, because `CREATE TABLE IF NOT
+hard-errors on a database predating `identity_id`, because `CREATE TABLE IF NOT
 EXISTS` cannot add a column and the mismatch would otherwise discard whole
 batches of rows silently. New columns need the same guard, for the same reason.
 
@@ -179,7 +179,7 @@ nothing that is being promised.
 New module `src/journeys.py`. Offline and read-only: it must not couple to the
 pipeline loop, which knows nothing about other cameras.
 
-1. **Gather.** Sightings for one `vehicle_id`, joined to `runs`, each converted
+1. **Gather.** Sightings for one `identity_id`, joined to `runs`, each converted
    through `absolute_time()`. Unorderable sightings are collected separately
    and reported, not dropped.
 2. **Collapse.** Consecutive sightings at the same camera become one *visit*

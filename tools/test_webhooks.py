@@ -107,7 +107,7 @@ def fresh_store():
     return store
 
 
-RETIRE = {"object_id": 137, "vehicle_id": 9,
+RETIRE = {"object_id": 137, "identity_id": 9, "identity_kind": "plate",
           "lane_id": "carriageway", "lane_flag": "wrong_way",
           "plate": "UP16PT9304", "plate_conf": 0.997,
           "cls_name": "car", "colour": "white",

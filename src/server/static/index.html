@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>traffic-detection</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header>
+  <h1>traffic&#8209;detection <span class="dim" id="uptime"></span></h1>
+  <nav id="nav">
+    <a href="#live"      data-view="live">live</a>
+    <a href="#search"    data-view="search">search</a>
+    <a href="#objects"   data-view="objects">objects</a>
+    <a href="#vehicles"  data-view="vehicles">vehicles</a>
+    <a href="#incidents" data-view="incidents">incidents<span class="n" id="n-inc" hidden>0</span></a>
+    <a href="#system"    data-view="system">system<span class="n" id="n-sys" hidden>0</span></a>
+  </nav>
+  <span class="spacer"></span>
+  <span class="muted" id="conn">connecting&hellip;</span>
+  <select id="pick" title="camera (press c to cycle)"></select>
+  <button id="toggle" title="start / stop this camera">&mdash;</button>
+</header>
+
+<main>
+
+<!-- ===================== LIVE ======================================== -->
+<section class="view" id="v-live">
+  <div class="cols">
+    <div>
+      <div class="notice warn" id="plate-banner" hidden></div>
+      <div class="panel flush">
+        <h2>
+          <span id="live-title">live</span>
+          <span class="spacer"></span>
+          <span class="muted" id="live-res"></span>
+        </h2>
+        <div class="stage" id="stage">
+          <img id="video" alt="">
+          <canvas id="overlay" width="1280" height="720"></canvas>
+          <div class="placeholder" id="ph">waiting for frames&hellip;</div>
+        </div>
+        <div class="toolbar">
+          <label class="check"><input type="checkbox" id="t-boxes" checked> boxes</label>
+          <label class="check"><input type="checkbox" id="t-labels" checked> labels</label>
+          <label class="check"><input type="checkbox" id="t-plates" checked> plates</label>
+          <label class="check"><input type="checkbox" id="t-attrs"> attributes</label>
+          <label class="check"><input type="checkbox" id="t-trails"> trails</label>
+          <label class="check"><input type="checkbox" id="t-flagged"> flagged only</label>
+          <label class="check"><input type="checkbox" id="t-video" checked> video</label>
+          <span class="spacer"></span>
+          <button id="fs" title="fullscreen (f)">&#9974; full</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>health <span class="spacer"></span>
+          <span class="tiny">a silently degrading feed is worse than an obviously broken one</span>
+        </h2>
+        <div class="body"><div class="tiles" id="tiles"></div></div>
+      </div>
+
+      <div class="panel">
+        <h2>counts &amp; crossings</h2>
+        <div class="body"><div class="tiles" id="counts"></div></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>in frame now <span class="spacer"></span><span class="muted" id="inframe-n"></span></h2>
+        <div class="body scroll" id="inframe"></div>
+      </div>
+      <div class="panel">
+        <h2>cameras</h2>
+        <div class="body scroll" id="cams"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== SEARCH ====================================== -->
+<section class="view" id="v-search">
+  <div class="panel">
+    <h2>open&#8209;vocabulary search <span class="spacer"></span>
+      <span class="tiny">ranks crops by visual similarity &mdash; it does not detect</span>
+    </h2>
+    <div class="body">
+      <form class="filters" id="search-form">
+        <input class="grow" type="search" id="q" autocomplete="off"
+               placeholder="a person carrying a bag &middot; a white car &middot; someone on a motorcycle">
+        <select id="s-camera"><option value="">all cameras</option></select>
+        <select id="s-model"></select>
+        <select id="s-top">
+          <option value="12">top 12</option>
+          <option value="24" selected>top 24</option>
+          <option value="48">top 48</option>
+          <option value="96">top 96</option>
+        </select>
+        <select id="s-minpx">
+          <option value="0">any size</option>
+          <option value="48">&ge; 48 px</option>
+          <option value="80">&ge; 80 px</option>
+          <option value="120">&ge; 120 px</option>
+        </select>
+        <select id="s-minconf">
+          <option value="0">any conf</option>
+          <option value="0.5">conf &ge; 0.5</option>
+          <option value="0.7">conf &ge; 0.7</option>
+        </select>
+        <button class="primary" type="submit">search</button>
+      </form>
+      <div class="tiles" id="index-tiles" style="margin-bottom:12px"></div>
+      <div id="index-note"></div>
+      <div id="search-status"></div>
+      <div class="grid" id="search-results"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== OBJECTS ===================================== -->
+<section class="view" id="v-objects">
+  <div class="panel">
+    <h2>objects <span class="spacer"></span><span class="muted" id="obj-total"></span></h2>
+    <div class="body">
+      <div class="filters">
+        <select id="o-camera"><option value="">all cameras</option></select>
+        <select id="o-class"><option value="">all classes</option></select>
+        <select id="o-group"><option value="">all groups</option></select>
+        <select id="o-attrkey"><option value="">any attribute</option></select>
+        <select id="o-attrval"><option value="">any value</option></select>
+        <label class="check"><input type="checkbox" id="o-flagged"> flagged only</label>
+        <label class="check"><input type="checkbox" id="o-crop" checked> has image</label>
+        <span class="spacer"></span>
+        <button id="o-reload">reload</button>
+      </div>
+      <div id="obj-status"></div>
+      <div class="grid" id="obj-results"></div>
+      <div class="pager" id="obj-pager" hidden>
+        <button id="o-prev">&larr; newer</button>
+        <span class="muted" id="o-page"></span>
+        <button id="o-next">older &rarr;</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== VEHICLES ==================================== -->
+<section class="view" id="v-vehicles">
+  <div class="cols">
+    <div>
+      <div class="panel">
+        <h2>vehicles <span class="spacer"></span><span class="muted" id="veh-total"></span></h2>
+        <div class="body">
+          <div class="notice" id="veh-note">
+            <strong>Plate&#8209;keyed identity only.</strong> A vehicle whose plate never
+            read confidently has no row here at all &mdash; and re&#8209;identification
+            needs an <em>exact</em> character match, so this is capped by OCR
+            accuracy rather than by the matching logic.
+          </div>
+          <div class="filters">
+            <input class="grow" type="search" id="v-plate" placeholder="filter by plate&hellip;">
+            <button id="v-reload">reload</button>
+          </div>
+          <div class="scroll" id="veh-list"></div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="panel">
+        <h2>cross&#8209;camera yield</h2>
+        <div class="body">
+          <div class="tiles" id="yield-tiles"></div>
+          <div class="tiny" style="margin-top:8px">The go/no&#8209;go measurement: two
+            cameras must produce character&#8209;identical voted plates to link at all.</div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>journey <span class="spacer"></span><span class="muted" id="journey-for"></span></h2>
+        <div class="body" id="journey">
+          <div class="empty">pick a vehicle to see its observed hops</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== INCIDENTS =================================== -->
+<section class="view" id="v-incidents">
+  <div class="panel">
+    <h2>incidents <span class="spacer"></span>
+      <div class="row">
+        <select id="i-kind"><option value="">all kinds</option></select>
+        <select id="i-camera"><option value="">all cameras</option></select>
+      </div>
+    </h2>
+    <div class="body scroll" id="inc-list"></div>
+  </div>
+</section>
+
+<!-- ===================== SYSTEM ====================================== -->
+<section class="view" id="v-system">
+  <div class="cols-even">
+    <div class="panel">
+      <h2>cameras</h2>
+      <div class="body scroll" id="sys-cams"></div>
+    </div>
+    <div class="panel">
+      <h2>storage &amp; writer</h2>
+      <div class="body"><div class="tiles" id="sys-store"></div></div>
+    </div>
+    <div class="panel">
+      <h2>webhook deliveries</h2>
+      <div class="body scroll" id="sys-del"></div>
+    </div>
+    <div class="panel">
+      <h2>disk <span class="spacer"></span>
+        <span class="tiny">pinned crops are a floor the budget cannot reclaim</span>
+      </h2>
+      <div class="body"><div class="tiles" id="sys-disk"></div></div>
+    </div>
+    <div class="panel">
+      <h2>streams</h2>
+      <div class="body"><div class="tiles" id="sys-stream"></div></div>
+    </div>
+    <div class="panel">
+      <h2>raw /health</h2>
+      <div class="body"><pre class="json" id="sys-raw"></pre></div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<div id="drawer-host"></div>
+<div id="toasts"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

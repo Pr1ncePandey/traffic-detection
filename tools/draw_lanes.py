@@ -1,8 +1,8 @@
 """Draw lane polygons and the divider by clicking on one frozen frame.
 
 Usage:
-  python tools/draw_lanes.py --source samples/input.mp4 --out cameras/shop1.yaml
-  python tools/draw_lanes.py --source samples/input.mp4 --frame 100
+  python tools/draw_lanes.py --source samples/short/input.mp4 --out cameras/shop1.yaml
+  python tools/draw_lanes.py --source samples/short/input.mp4 --frame 100
 
 Clicks:
   - Left-click the corners of road 1, then ENTER, then type its name and the
@@ -154,7 +154,7 @@ def main():
     global _divider, _points
     p = argparse.ArgumentParser(
         description="Click lane polygons + divider, save a cameras yaml block")
-    p.add_argument("--source", default="samples/input.mp4")
+    p.add_argument("--source", default="samples/short/input.mp4")
     p.add_argument("--frame", type=int, default=60)
     p.add_argument("--out", default=None)
     args = p.parse_args()

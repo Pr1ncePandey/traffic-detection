@@ -9,12 +9,19 @@ Schema shape worth knowing:
   objects     one row per track, NOT per frame - the thing that was missing
   detections  one row per object per frame (what tracks.csv used to be)
   attributes  TALL (object_id, key, value) rather than wide columns, so a new
-              attribute - colour, brand, speed - needs no migration. The
-              (key, value) index is what keeps plate lookup fast.
-  vehicles    one row per PLATE, not per track - the durable identity a track
-              id cannot provide. objects.vehicle_id points here, so several
-              sightings of one car share an entity while each keeps its own
-              objects row. See trackers/identity.py for why they are split.
+              attribute - colour, speed - needs no migration. The (key, value)
+              index is what keeps plate lookup fast.
+  identities  one row per DURABLE IDENTITY, not per track - the thing a track
+              id cannot provide, because ByteTrack mints a new id every time an
+              object reappears. objects.identity_id points here, so several
+              sightings of one entity share it while each keeps its own objects
+              row. See trackers/identity.py for why they are split.
+
+              CLASS-AGNOSTIC, which the former `vehicles` table was not: it
+              was keyed `plate TEXT NOT NULL UNIQUE`, so only vehicles could
+              ever have a durable identity and no person could be followed
+              across cameras. `kind` discriminates instead, exactly as
+              objects.cls_group does for sightings.
 """
 
 import json
@@ -62,26 +69,53 @@ CREATE TABLE IF NOT EXISTS objects(
   first_seen_s REAL, last_seen_s REAL, frames_seen INT,
   best_conf REAL, crop_path TEXT,
   lane_id TEXT, lane_flag TEXT,
-  vehicle_id INT,
+  identity_id INT,
   UNIQUE(run_id, track_id));
 CREATE INDEX IF NOT EXISTS idx_objects_class ON objects(cls_name);
-CREATE INDEX IF NOT EXISTS idx_objects_vehicle ON objects(vehicle_id);
+CREATE INDEX IF NOT EXISTS idx_objects_identity ON objects(identity_id);
 
--- Durable identity. UNIQUE(plate) is both the correctness constraint and the
--- lookup index, so no second index is declared for it.
--- No sightings counter on purpose: how many times a vehicle was seen is
--- exactly COUNT(*) over objects.vehicle_id, which idx_objects_vehicle already
--- makes cheap. A stored counter would be bumped by every mid-track rebind as
--- well as by finalize, so it would drift from the rows it claims to count -
--- and a number that is quietly wrong is worse than a join.
-CREATE TABLE IF NOT EXISTS vehicles(
-  id INTEGER PRIMARY KEY, plate TEXT NOT NULL UNIQUE,
-  first_seen_at REAL, last_seen_at REAL);
+-- Durable identity, one row per entity. `kind` is the identity AXIS and `key`
+-- the value on it: a licence plate is kind='plate', key='HR26DK8337'. An
+-- appearance cluster from the embeddings table will be kind='person_reid' with
+-- a synthetic cluster id. A new axis is a new VALUE, never a new table.
+--
+-- UNIQUE(kind, key) is both the correctness constraint - one entity per key
+-- within its axis - and the lookup index, so no second index is declared for
+-- it: `WHERE kind=? AND key=?` is a leftmost-prefix hit. Bind too loosely and
+-- two entities' histories merge, which no later frame undoes and no exception
+-- reports, so this constraint is the thing that catches it.
+--
+-- NO sightings counter, NO cached centroid, NO member count, on purpose: how
+-- many times an entity was seen is exactly COUNT(*) over objects.identity_id,
+-- which idx_objects_identity already makes cheap, and a centroid is the mean
+-- of its members' vectors in `embeddings`. A stored aggregate would be bumped
+-- by every mid-track rebind as well as by finalize, so it would drift from the
+-- rows it claims to summarise - and a number that is quietly wrong is worse
+-- than a join.
+--
+-- NO `model` column either. The encoder is EVIDENCE for an identity, not part
+-- of it: keying on it would mint a fresh identity universe on every encoder
+-- swap and orphan every existing objects.identity_id. The embedding space is
+-- recorded once, in embeddings.model/dim, where the vectors are.
+CREATE TABLE IF NOT EXISTS identities(
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL,
+  key  TEXT NOT NULL,
+  first_seen_at REAL, last_seen_at REAL,
+  UNIQUE(kind, key));
 
+-- No `event` column. counting.py wrote every zone crossing twice - once here
+-- and once as an events row - and the two copies did not even have equal
+-- durability: detections is _SHEDDABLE and events is not, so under queue
+-- pressure THIS was the copy that vanished. events was already canonical
+-- (query.py, report.py and /events all read it), nothing ever read this
+-- column, and it was empty on all but a handful of rows in the highest-volume
+-- table in the schema. Detection.event still exists in memory and still
+-- reaches tracks.csv; it is only not duplicated into SQLite.
 CREATE TABLE IF NOT EXISTS detections(
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INT, frame_id INT, object_id INT,
   x1 INT, y1 INT, x2 INT, y2 INT, conf REAL,
-  cls_name TEXT, event TEXT, lane_id TEXT, lane_flag TEXT);
+  cls_name TEXT, lane_id TEXT, lane_flag TEXT);
 CREATE INDEX IF NOT EXISTS idx_det_object ON detections(object_id);
 CREATE INDEX IF NOT EXISTS idx_det_frame ON detections(frame_id);
 
@@ -89,6 +123,44 @@ CREATE TABLE IF NOT EXISTS attributes(
   object_id INT, key TEXT, value TEXT, conf REAL, updated_s REAL,
   PRIMARY KEY(object_id, key));
 CREATE INDEX IF NOT EXISTS idx_attr_kv ON attributes(key, value);
+
+-- Open-vocabulary search vectors, one per object per embedding space.
+-- Written OFFLINE by tools/embed_crops.py, never by the pipeline: no
+-- real-time decision needs an embedding, and keeping inference out of
+-- pipeline.py makes a model swap a re-run of a script.
+--
+-- Every non-obvious column is a known failure mode made queryable:
+--   model      cosine is only meaningful WITHIN one space, so two spaces must
+--              never be ranked against each other. Present from the first
+--              insert; adding it later, with an index already built, is the
+--              expensive version of this.
+--   dim        varies by model (512 for ViT-B/16, 768 for L/14), so the
+--              reader cannot assume a width.
+--   vec        float32 little-endian, L2-NORMALISED ON WRITE. That is what
+--              lets search be a plain dot product, so the query path needs no
+--              division and cannot disagree with itself about the metric.
+--   crop_w/h   the crop's real pixel size, so the resolution floor is a WHERE
+--              clause rather than an anecdote.
+--   crop_conf  detection confidence of the frame the crop came from. NOT
+--              objects.best_conf, which is the track maximum: 35-51% of crops
+--              come from sub-threshold detections and must be excludable.
+--   crop_area  box area as a fraction of frame. A near-full-frame box is a
+--              picture of the whole scene, not an object crop, and embeds as
+--              confident garbage that matches almost any query.
+-- PRIMARY KEY(object_id, model) matches attributes' one-row-per-thing shape
+-- and makes the retention delete a plain DELETE ... WHERE object_id IN (...).
+CREATE TABLE IF NOT EXISTS embeddings(
+  object_id  INTEGER NOT NULL,
+  model      TEXT NOT NULL,
+  dim        INTEGER NOT NULL,
+  vec        BLOB NOT NULL,
+  crop_w     INTEGER,
+  crop_h     INTEGER,
+  crop_conf  REAL,
+  crop_area  REAL,
+  created_at REAL,
+  PRIMARY KEY(object_id, model));
+CREATE INDEX IF NOT EXISTS idx_emb_model ON embeddings(model);
 
 CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INT, frame_id INT, object_id INT,
@@ -104,7 +176,7 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 -- that has already seen this id must be able to recognise it. INSERT OR IGNORE
 -- on the primary key also makes a double fire locally harmless.
 CREATE TABLE IF NOT EXISTS incidents(
-  id TEXT PRIMARY KEY, camera TEXT, kind TEXT, object_id INT, vehicle_id INT,
+  id TEXT PRIMARY KEY, camera TEXT, kind TEXT, object_id INT, identity_id INT,
   payload_json TEXT, created_at REAL);
 CREATE INDEX IF NOT EXISTS idx_incidents_created ON incidents(created_at);
 CREATE INDEX IF NOT EXISTS idx_incidents_kind ON incidents(kind);
@@ -132,13 +204,13 @@ _SQL = {
                "(id,run_id,frame_no,ts,raw_path,annotated_path,segment_id,frame_offset,bytes)"
                " VALUES(?,?,?,?,?,?,?,?,?)"),
     "detections": ("INSERT INTO detections"
-                   "(run_id,frame_id,object_id,x1,y1,x2,y2,conf,cls_name,event,lane_id,lane_flag)"
-                   " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"),
+                   "(run_id,frame_id,object_id,x1,y1,x2,y2,conf,cls_name,lane_id,lane_flag)"
+                   " VALUES(?,?,?,?,?,?,?,?,?,?,?)"),
     # Repeated upserts are expected (first sight, then finalize), so conflicts
     # update rather than fail. best_conf and frames_seen only ever grow.
     "objects": ("INSERT INTO objects"
                 "(id,run_id,track_id,cls_name,cls_group,first_seen_s,last_seen_s,"
-                "frames_seen,best_conf,crop_path,lane_id,lane_flag,vehicle_id)"
+                "frames_seen,best_conf,crop_path,lane_id,lane_flag,identity_id)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(run_id,track_id) DO UPDATE SET"
                 " cls_name=excluded.cls_name, cls_group=excluded.cls_group,"
@@ -148,21 +220,21 @@ _SQL = {
                 " crop_path=COALESCE(excluded.crop_path, objects.crop_path),"
                 " lane_id=COALESCE(excluded.lane_id, objects.lane_id),"
                 " lane_flag=COALESCE(excluded.lane_flag, objects.lane_flag),"
-                # COALESCE, not excluded.*: a plate is read part-way through a
-                # track, so an earlier upsert legitimately has no vehicle_id
-                # and must not blank one that is already known.
-                " vehicle_id=COALESCE(excluded.vehicle_id, objects.vehicle_id)"),
+                # COALESCE, not excluded.*: an identity is resolved part-way
+                # through a track, so an earlier upsert legitimately has no
+                # identity_id and must not blank one that is already known.
+                " identity_id=COALESCE(excluded.identity_id, objects.identity_id)"),
     # ON CONFLICT rather than a bare INSERT is load-bearing, not tidiness:
-    # _commit() catches per BATCH, so one UNIQUE(plate) violation would drop up
-    # to batch_rows (500) unrelated rows with it.
-    # Idempotent: MIN/MAX rather than assignment, so re-binding a plate mid
+    # _commit() catches per BATCH, so one UNIQUE(kind,key) violation would drop
+    # up to batch_rows (500) unrelated rows with it.
+    # Idempotent: MIN/MAX rather than assignment, so re-binding a key mid
     # track (the consensus is still being voted) cannot drag first_seen_at
     # forward or last_seen_at backward.
-    "vehicles": ("INSERT INTO vehicles(id,plate,first_seen_at,last_seen_at)"
-                 " VALUES(?,?,?,?)"
-                 " ON CONFLICT(plate) DO UPDATE SET"
-                 " first_seen_at=MIN(vehicles.first_seen_at, excluded.first_seen_at),"
-                 " last_seen_at=MAX(vehicles.last_seen_at, excluded.last_seen_at)"),
+    "identities": ("INSERT INTO identities(id,kind,key,first_seen_at,last_seen_at)"
+                   " VALUES(?,?,?,?,?)"
+                   " ON CONFLICT(kind,key) DO UPDATE SET"
+                   " first_seen_at=MIN(identities.first_seen_at, excluded.first_seen_at),"
+                   " last_seen_at=MAX(identities.last_seen_at, excluded.last_seen_at)"),
     # Keep the most CONFIDENT read, not the most recent - a late, worse OCR
     # result must not overwrite a good one.
     "attributes": ("INSERT INTO attributes(object_id,key,value,conf,updated_s)"
@@ -172,31 +244,44 @@ _SQL = {
                    " WHERE excluded.conf >= attributes.conf"),
     "events": ("INSERT INTO events(run_id,frame_id,object_id,kind,detail_json,ts)"
                " VALUES(?,?,?,?,?,?)"),
+    # Re-embedding the same object in the same space replaces the vector
+    # rather than failing, so the embedder is resumable AND re-runnable: a
+    # model re-export or a changed preprocessing step is a plain re-run.
+    # Conflicts are on (object_id, model), so a second embedding space lands
+    # alongside the first instead of overwriting it.
+    "embeddings": ("INSERT INTO embeddings"
+                   "(object_id,model,dim,vec,crop_w,crop_h,crop_conf,crop_area,created_at)"
+                   " VALUES(?,?,?,?,?,?,?,?,?)"
+                   " ON CONFLICT(object_id,model) DO UPDATE SET"
+                   " dim=excluded.dim, vec=excluded.vec,"
+                   " crop_w=excluded.crop_w, crop_h=excluded.crop_h,"
+                   " crop_conf=excluded.crop_conf, crop_area=excluded.crop_area,"
+                   " created_at=excluded.created_at"),
 }
 
 _COLS = {
     "frames": ("id", "run_id", "frame_no", "ts", "raw_path", "annotated_path",
                "segment_id", "frame_offset", "bytes"),
     "detections": ("run_id", "frame_id", "object_id", "x1", "y1", "x2", "y2",
-                   "conf", "cls_name", "event", "lane_id", "lane_flag"),
+                   "conf", "cls_name", "lane_id", "lane_flag"),
     "objects": ("id", "run_id", "track_id", "cls_name", "cls_group", "first_seen_s",
                 "last_seen_s", "frames_seen", "best_conf", "crop_path",
-                "lane_id", "lane_flag", "vehicle_id"),
-    "vehicles": ("id", "plate", "first_seen_at", "last_seen_at"),
+                "lane_id", "lane_flag", "identity_id"),
+    "identities": ("id", "kind", "key", "first_seen_at", "last_seen_at"),
     "events": ("run_id", "frame_id", "object_id", "kind", "detail_json", "ts"),
 }
 
 # (table, column, what it was added for) - checked before the schema script.
 # Add an entry whenever a column joins a table that already ships in the wild.
 _REQUIRED_COLS = (
-    ("objects", "vehicle_id", "vehicle re-identification"),
+    ("objects", "identity_id", "class-agnostic durable identity"),
     ("runs", "time_base", "comparable cross-camera timestamps"),
 )
 
 # Which tables may be DROPPED rather than blocked on when the write queue is
 # full. The split is by volume, not importance: frames and detections are
 # written once per frame and are reconstructible-ish, so shedding them lets the
-# queue drain. objects/vehicles/attributes/events are ~once per track or per
+# queue drain. objects/identities/attributes/events are ~once per track or per
 # incident, so they are the durable record and always wait their turn - and
 # because the droppable tables are the ones filling the queue, that wait ends.
 _SHEDDABLE = frozenset({"frames", "detections"})
@@ -237,9 +322,9 @@ class SqliteStore:
         # check_same_thread=False: built here, written only by the writer thread.
         self._conn = sqlite3.connect(path, check_same_thread=False)
         # BEFORE executescript, not after: SCHEMA declares an index ON
-        # objects(vehicle_id), which on a pre-change file fails with a bare
-        # "no such column: vehicle_id" and aborts the rest of the script (so
-        # `vehicles` is never created either). Checking first turns that into
+        # objects(identity_id), which on a pre-change file fails with a bare
+        # "no such column: identity_id" and aborts the rest of the script (so
+        # `identities` is never created either). Checking first turns that into
         # an error that says what to do.
         self._assert_schema_current()
         self._conn.executescript(SCHEMA)
@@ -255,13 +340,13 @@ class SqliteStore:
         self._id_lock = threading.Lock()
         self._frame_id = self._max_id("frames")
         self._object_id = self._max_id("objects")
-        self._vehicle_id = self._max_id("vehicles")
-        # plate -> id for vehicles minted but not necessarily committed yet.
+        self._identity_id = self._max_id("identities")
+        # (kind, key) -> id for identities minted but not yet committed.
         # Consulted before the DB so a lookup during the commit window cannot
         # mint a second id for a plate that already has one. Capped: anything
         # this many mints old has certainly been committed (the writer flushes
         # every batch_rows rows or commit_interval seconds).
-        self._minted: OrderedDict[str, int] = OrderedDict()
+        self._minted: OrderedDict[tuple[str, str], int] = OrderedDict()
         # Live sources shed instead of applying backpressure: a blocking put
         # stalls inference, and on a camera that means dropping real-world time
         # that can never be recovered. A file is merely slow, so it keeps the
@@ -316,10 +401,10 @@ class SqliteStore:
             self._object_id += 1
             return self._object_id
 
-    def next_vehicle_id(self) -> int:
+    def next_identity_id(self) -> int:
         with self._id_lock:
-            self._vehicle_id += 1
-            return self._vehicle_id
+            self._identity_id += 1
+            return self._identity_id
 
     # --- run lifecycle ------------------------------------------------------
     def start_run(self, meta: dict) -> int:
@@ -398,68 +483,106 @@ class SqliteStore:
         self._enqueue("attributes", (int(object_id), str(key), str(value),
                                      float(conf), float(ts)))
 
-    # --- durable identity (see trackers/identity.py) ------------------------
-    def lookup_vehicle(self, plate: str):
-        """vehicle id for a plate, or None. Synchronous: the caller needs the
-        id now, to label this frame.
+    def put_embedding(self, object_id: int, model: str, vec, crop_w=None,
+                      crop_h=None, crop_conf=None, crop_area=None,
+                      ts: float = 0.0):
+        """Queue one object's search vector, through the same writer thread as
+        everything else.
 
-        One indexed hit on UNIQUE(plate), on the dedicated read connection.
-        Only reached on a plate's first confident read in this process - the
-        PlateIdentity LRU absorbs the rest - so it is not on the hot path.
+        Positional like put_attribute rather than going through _put/_COLS:
+        the row has a fixed shape and a BLOB, so a dict round-trip would buy
+        nothing.
+
+        `vec` is expected ALREADY L2-normalised - see the DDL. It is converted
+        to little-endian float32 here so the on-disk layout does not depend on
+        the writer's architecture, which is what lets a database move between
+        machines and still be searchable.
         """
-        key = str(plate)
-        pending = self._minted.get(key)
+        import numpy as np
+        arr = np.ascontiguousarray(vec, dtype="<f4").ravel()
+        self._enqueue("embeddings", (
+            int(object_id), str(model), int(arr.size), arr.tobytes(),
+            None if crop_w is None else int(crop_w),
+            None if crop_h is None else int(crop_h),
+            None if crop_conf is None else float(crop_conf),
+            None if crop_area is None else float(crop_area),
+            float(ts) if ts else time.time()))
+
+    # --- durable identity (see trackers/identity.py) ------------------------
+    # kind is the identity AXIS ('plate', later 'person_reid'), key the value on
+    # it. These three are generic so a second axis needs no new storage method;
+    # trackers/identity.py binds kind='plate' at the wiring point.
+    def lookup_identity(self, kind: str, key: str):
+        """Identity id for (kind, key), or None. Synchronous: the caller needs
+        the id now, to label this frame.
+
+        One indexed hit on UNIQUE(kind, key) - a leftmost-prefix match, so no
+        separate index - on the dedicated read connection. Only reached on a
+        key's first confident read in this process; the PlateIdentity LRU
+        absorbs the rest, so it is not on the hot path.
+        """
+        k, v = str(kind), str(key)
+        pending = self._minted.get((k, v))
         if pending is not None:
             return int(pending)
-        row = self._rconn.execute("SELECT id FROM vehicles WHERE plate=?",
-                                  (key,)).fetchone()
+        row = self._rconn.execute(
+            "SELECT id FROM identities WHERE kind=? AND key=?", (k, v)).fetchone()
         return None if row is None else int(row[0])
 
-    def create_vehicle(self, plate: str, ts: float = 0.0) -> int:
-        """Mint a vehicle id for a new plate and queue the row.
+    def create_identity(self, kind: str, key: str, ts: float = 0.0) -> int:
+        """Mint an identity id for a new (kind, key) and queue the row.
 
         The id comes from the in-memory counter, like next_object_id, so there
         is no round trip; the INSERT goes through the writer thread like every
-        other write. The two can disagree only if a plate is evicted from the
-        identity cache before its INSERT commits, and ON CONFLICT(plate) makes
-        that harmless: the first row wins and keeps its id.
+        other write. The two can disagree only if a key is evicted from the
+        identity cache before its INSERT commits, and ON CONFLICT(kind,key)
+        makes that harmless: the first row wins and keeps its id.
         """
-        key = str(plate)
-        existing = self.lookup_vehicle(key)
+        k, v = str(kind), str(key)
+        existing = self.lookup_identity(k, v)
         if existing is not None:
             # Already known (committed, or minted moments ago). Still queue the
-            # row so sightings/last_seen_at advance via ON CONFLICT.
-            self._put("vehicles", {"id": existing, "plate": key,
-                                   "first_seen_at": float(ts or 0.0),
-                                   "last_seen_at": float(ts or 0.0)})
+            # row so last_seen_at advances via ON CONFLICT.
+            self._put("identities", {"id": existing, "kind": k, "key": v,
+                                     "first_seen_at": float(ts or 0.0),
+                                     "last_seen_at": float(ts or 0.0)})
             return existing
-        vid = self.next_vehicle_id()
-        self._minted[key] = vid
+        vid = self.next_identity_id()
+        self._minted[(k, v)] = vid
         while len(self._minted) > self.MINTED_CAP:
             self._minted.popitem(last=False)
-        self._put("vehicles", {"id": vid, "plate": key,
-                               "first_seen_at": float(ts or 0.0),
-                               "last_seen_at": float(ts or 0.0)})
+        self._put("identities", {"id": vid, "kind": k, "key": v,
+                                 "first_seen_at": float(ts or 0.0),
+                                 "last_seen_at": float(ts or 0.0)})
         return vid
 
-    def touch_vehicle(self, vehicle_id: int, plate: str, ts: float = 0.0,
-                      last_ts: float | None = None) -> None:
-        """Widen a known vehicle's seen window. Idempotent (MIN/MAX upsert).
+    def touch_identity(self, identity_id: int, kind: str, key: str,
+                       ts: float = 0.0, last_ts: float | None = None) -> None:
+        """Widen a known identity's seen window. Idempotent (MIN/MAX upsert).
 
-        Needed because the common case - a plate already in the identity cache
-        or already in the table - never reaches create_vehicle, so without this
-        a vehicle's last_seen_at would be frozen at whenever it was first read.
+        Needed because the common case - a key already in the identity cache or
+        already in the table - never reaches create_identity, so without this an
+        identity's last_seen_at would be frozen at whenever it was first read.
 
         Pass `last_ts` to submit a whole interval rather than one instant:
-        _finalize does that with the sighting's own bounds, so the vehicle's
-        window covers when the CAR was visible, not merely when its plate
-        happened to be legible.
+        _finalize does that with the sighting's own bounds, so the window covers
+        when the ENTITY was visible, not merely when its key happened to be
+        legible.
+
+        KNOWN LIMITATION, unchanged by the identities rename: `ts` arrives as
+        the run's own first_seen_s, which is a wall-clock epoch for a live
+        source and clip-seconds for a file (see src/timebase.py). In one DB
+        holding both, MIN() therefore always prefers the clip-seconds value.
+        Fixing it means normalising through runs.time_base here and accepting
+        NULL for an unorderable file run - a semantic change to the column, so
+        it is deliberately NOT bundled into a rename.
         """
         first = float(ts or 0.0)
         last = first if last_ts is None else float(last_ts)
-        self._put("vehicles", {"id": int(vehicle_id), "plate": str(plate),
-                               "first_seen_at": min(first, last),
-                               "last_seen_at": max(first, last)})
+        self._put("identities", {"id": int(identity_id), "kind": str(kind),
+                                 "key": str(key),
+                                 "first_seen_at": min(first, last),
+                                 "last_seen_at": max(first, last)})
 
     def delete_frames(self, frame_ids) -> None:
         """Queue frame-row deletion (used by the Reaper).
@@ -496,10 +619,10 @@ class SqliteStore:
             # that would take the batch down with it.
             self._conn.execute(
                 "INSERT OR IGNORE INTO incidents"
-                "(id,camera,kind,object_id,vehicle_id,payload_json,created_at)"
+                "(id,camera,kind,object_id,identity_id,payload_json,created_at)"
                 " VALUES(?,?,?,?,?,?,?)",
                 (str(incident["id"]), incident.get("camera"), incident.get("kind"),
-                 incident.get("object_id"), incident.get("vehicle_id"),
+                 incident.get("object_id"), incident.get("identity_id"),
                  json.dumps(incident.get("payload", {}), default=str),
                  float(incident.get("created_at") or now)))
             for endpoint in endpoints:

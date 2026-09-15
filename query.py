@@ -70,6 +70,25 @@ def parse_args():
     p.add_argument("--flagged", action="store_true", help="wrong-way / wrong-lane only")
     p.add_argument("--list", action="store_true")
     p.add_argument("--limit", type=int, default=50)
+    # --- open-vocabulary search (see docs/vector-search.md) ---------------
+    p.add_argument("--find", default=None, metavar="TEXT",
+                   help="open-vocabulary search over object crops, e.g. "
+                        "--find 'a person carrying a cardboard box'. Ranks; it "
+                        "does NOT decide presence - there is no calibrated "
+                        "similarity floor, so zero good matches still return "
+                        "the nearest rows, labelled as such.")
+    p.add_argument("--top", type=int, default=10,
+                   help="--find: how many hits to rank (default 10)")
+    p.add_argument("--model", default=None,
+                   help="--find: embedding space to search (default "
+                        "clip-vit-b16). Must match what was embedded")
+    p.add_argument("--min-px", type=int, default=0,
+                   help="--find: extra floor on the crop's short side")
+    p.add_argument("--min-conf", type=float, default=0.0,
+                   help="--find: extra floor on the crop's detection conf")
+    p.add_argument("--no-llm", action="store_true",
+                   help="--find: skip the claude CLI and use deterministic "
+                        "scope parsing only (works offline)")
     return p.parse_args()
 
 
@@ -92,12 +111,13 @@ FROM objects o
 
 def _show(conn, row):
     print(f"\nObject #{row['id']}  (track {row['track_id']}, run {row['run_id']})")
-    vid = row["vehicle_id"] if "vehicle_id" in row.keys() else None
+    vid = row["identity_id"] if "identity_id" in row.keys() else None
     if vid is not None:
-        veh = conn.execute("SELECT plate FROM vehicles WHERE id=?", (vid,)).fetchone()
-        n = conn.execute("SELECT COUNT(*) n FROM objects WHERE vehicle_id=?",
+        veh = conn.execute("SELECT key FROM identities WHERE id=?",
+                           (vid,)).fetchone()
+        n = conn.execute("SELECT COUNT(*) n FROM objects WHERE identity_id=?",
                          (vid,)).fetchone()["n"]
-        plate = veh["plate"] if veh else "?"
+        plate = veh["key"] if veh else "?"
         print(f"  Vehicle   : V{vid} ({plate}) - "
               f"{n} sighting{'s' if n != 1 else ''} on record")
     print(f"  Class     : {row['cls_name']}  [{row['cls_group']}]")
@@ -152,7 +172,7 @@ def _show_path(path):
     knows the car drove a particular way between two cameras. It does not.
     """
     plate = path.plate or "?"
-    print(f"\nVehicle V{path.vehicle_id}  plate {plate}")
+    print(f"\nVehicle V{path.identity_id}  plate {plate}")
     print(f"  {path.total_sightings} sighting(s) on record across "
           f"{len(path.cameras)} camera(s): {', '.join(path.cameras) or '-'}")
 
@@ -244,7 +264,7 @@ def _show_yield(summary):
         return
     print(f"\n{'vehicle':>8} {'cams':>5} {'sightings':>10}  plate")
     for r in summary["rows"]:
-        print(f"{('V' + str(r['vehicle_id'])):>8} {r['cams']:>5} "
+        print(f"{('V' + str(r['identity_id'])):>8} {r['cams']:>5} "
               f"{r['sightings']:>10}  {r['plate'] or ''}")
     print(f"\n{len(summary['rows'])} vehicle(s) with a cross-camera hop. "
           f"Inspect one: python query.py --path <id>")
@@ -257,7 +277,7 @@ def _table(rows):
     print(f"{'id':>5} {'track':>6} {'veh':>5} {'class':<12} {'group':<14} "
           f"{'frames':>6} {'conf':>5} {'flag':<10} plate")
     for r in rows:
-        vid = r["vehicle_id"] if "vehicle_id" in r.keys() else None
+        vid = r["identity_id"] if "identity_id" in r.keys() else None
         print(f"{r['id']:>5} {r['track_id']:>6} "
               f"{('V' + str(vid)) if vid is not None else '-':>5} "
               f"{str(r['cls_name'] or ''):<12} "
@@ -265,6 +285,59 @@ def _table(rows):
               f"{(r['best_conf'] or 0):>5.2f} {str(r['lane_flag'] or 'ok'):<10} "
               f"{r['plate'] or ''}")
     print(f"\n{len(rows)} row(s).")
+
+
+def _show_find(conn, args):
+    """Open-vocabulary search. Prints the route and the honesty caveat with
+    every answer, because neither is optional: the route makes a bad scope
+    visible as a scoping decision, and the caveat stops a ranked list reading
+    as a verdict."""
+    from src.query.clip_onnx import DEFAULT_MODEL
+    from src.query.router import load_vocabulary, route
+    from src.query.search import search
+
+    model = args.model or DEFAULT_MODEL
+    vocab = load_vocabulary(conn)
+    r = route(args.find, vocab, use_llm=not args.no_llm)
+
+    print(f'query    "{args.find}"')
+    print(f"route    vector ({r.source})")
+    floors = [f"crop_conf>={args.min_conf}" if args.min_conf else None,
+              f"short>={args.min_px}px" if args.min_px else None]
+    scope_bits = r.scope.describe()
+    extra = ", ".join(f for f in floors if f)
+    print(f"  scope   {scope_bits}{', ' + extra if extra else ''}")
+
+    res = search(conn, r.subject, r.scope, model=model, top_k=args.top,
+                 min_px=args.min_px, min_conf=args.min_conf)
+    if "error" in res:
+        print(f"  error   {res['error']}")
+        return
+    print(f'  subject "{r.subject}" -> {res["candidates"]} candidates, '
+          f"ranked in {model}")
+    for w in r.warnings:
+        print(f"  note    {w}")
+    if res.get("note"):
+        print(f"  note    {res['note']}")
+    if res["excluded_runs"]:
+        print(f"  note    {len(res['excluded_runs'])} run(s) timestamp on "
+              f"clip-seconds, so a wall-clock window cannot order them. "
+              f"They were NOT filtered - their rows are included as-is.")
+    if not res["hits"]:
+        return
+
+    print(f"\n{'#':>3} {'obj':>6} {'score':>6} {'class':<12} {'camera':<14} "
+          f"{'crop':>10} {'conf':>5}  crop url")
+    for i, h in enumerate(res["hits"], 1):
+        print(f"{i:>3} {h['object_id']:>6} {h['score']:>6.3f} "
+              f"{str(h['cls_name'] or ''):<12} {str(h['camera'] or ''):<14} "
+              f"{str(h['crop_w']) + 'x' + str(h['crop_h']):>10} "
+              f"{(h['crop_conf'] or 0):>5.2f}  /crops/{h['object_id']}.jpg")
+    lo, hi = res["score_spread"]
+    print(f"\nNo similarity floor is calibrated for this model: these are the "
+          f"nearest {len(res['hits'])} of {res['candidates']} candidates "
+          f"(all scores {lo:.3f}..{hi:.3f}), NOT confirmed matches. Verify by "
+          f"opening the crops.")
 
 
 def main():
@@ -275,7 +348,9 @@ def main():
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
 
-    if args.yield_:
+    if args.find:
+        _show_find(conn, args)
+    elif args.yield_:
         _show_yield(yield_summary(conn))
     elif args.path is not None:
         kwargs = {}
@@ -301,15 +376,15 @@ def main():
         for r in rows:
             _show(conn, r)
     elif args.vehicle is not None:
-        veh = conn.execute("SELECT * FROM vehicles WHERE id=?",
+        veh = conn.execute("SELECT * FROM identities WHERE id=? AND kind='plate'",
                            (args.vehicle,)).fetchone()
         if veh is None:
             print(f"No vehicle V{args.vehicle}.")
         else:
-            print(f"Vehicle V{veh['id']}  plate {veh['plate']}")
+            print(f"Vehicle V{veh['id']}  plate {veh['key']}")
             print(f"  First seen: {(veh['first_seen_at'] or 0):.2f}"
                   f"   Last seen: {(veh['last_seen_at'] or 0):.2f}")
-            rows = conn.execute(_SELECT + " WHERE o.vehicle_id=?"
+            rows = conn.execute(_SELECT + " WHERE o.identity_id=?"
                                 " ORDER BY o.run_id, o.first_seen_s",
                                 (args.vehicle,)).fetchall()
             print(f"  {len(rows)} sighting(s):")
@@ -317,12 +392,14 @@ def main():
                 _show(conn, r)
     elif args.plate:
         want = _norm(args.plate)
-        # Exact hits go through the vehicles table, which is the indexed,
-        # cross-run answer. The attributes scan below still runs, so a sighting
-        # whose plate was read but never confident enough to bind is not lost.
-        veh = conn.execute("SELECT * FROM vehicles WHERE plate=?", (want,)).fetchone()
+        # Exact hits go through the identities table, which is the indexed,
+        # cross-run answer (UNIQUE(kind, key)). The attributes scan below still
+        # runs, so a sighting whose plate was read but never confident enough to
+        # bind is not lost.
+        veh = conn.execute("SELECT * FROM identities WHERE kind='plate' AND key=?",
+                           (want,)).fetchone()
         if veh is not None:
-            print(f"Vehicle V{veh['id']}  plate {veh['plate']}  "
+            print(f"Vehicle V{veh['id']}  plate {veh['key']}  "
                   f"({(veh['first_seen_at'] or 0):.2f}s -> "
                   f"{(veh['last_seen_at'] or 0):.2f}s)")
         rows = conn.execute(_SELECT + " WHERE o.id IN (SELECT object_id FROM"

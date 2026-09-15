@@ -45,7 +45,11 @@ def section(title):
 
 
 def fake_backend():
-    """A dict standing in for the vehicles table. Returns (lookup, create, rows)."""
+    """A dict standing in for the identities table. Returns (lookup, create, rows).
+
+    PlateIdentity is storage-agnostic and takes already-plate-bound callables,
+    so these stay single-argument: identities.kind is bound in from_config.
+    """
     rows: dict = {}
     counter = {"n": 0}
 
@@ -173,23 +177,27 @@ for oid_ts, run_track in ((1.0, 4), (100.0, 31)):
                           "cls_group": "vehicle", "first_seen_s": oid_ts,
                           "last_seen_s": oid_ts + 4, "frames_seen": 10,
                           "best_conf": 0.9, "crop_path": None, "lane_id": None,
-                          "lane_flag": None, "vehicle_id": v_run2})
+                          "lane_flag": None, "identity_id": v_run2})
 store2.flush()
 conn = store2.connect_ro()
-vrows = conn.execute("SELECT id, plate, first_seen_at, last_seen_at"
-                     " FROM vehicles").fetchall()
-check("exactly one vehicles row exists", len(vrows) == 1,
+vrows = conn.execute("SELECT id, kind, key, first_seen_at, last_seen_at"
+                     " FROM identities").fetchall()
+check("exactly one identities row exists", len(vrows) == 1,
       str([tuple(r) for r in vrows]))
 check("first_seen_at kept the earliest reading", vrows[0]["first_seen_at"] == 1.0,
       str(vrows[0]["first_seen_at"]))
 check("last_seen_at advanced to the later reading",
       vrows[0]["last_seen_at"] == 100.0, str(vrows[0]["last_seen_at"]))
-seen = conn.execute("SELECT COUNT(*) n FROM objects WHERE vehicle_id=?",
+seen = conn.execute("SELECT COUNT(*) n FROM objects WHERE identity_id=?",
                     (v_run2,)).fetchone()["n"]
-check("sightings are derivable from objects.vehicle_id", seen == 2, str(seen))
+check("sightings are derivable from objects.identity_id", seen == 2, str(seen))
+check("the identity row is on the plate axis", vrows[0]["kind"] == "plate",
+      str(vrows[0]["kind"]))
+check("and its key is the normalised plate", vrows[0]["key"] == "HR26DK8337",
+      str(vrows[0]["key"]))
 store2.close()
 
-section("10. a database predating vehicle_id fails loudly, not silently")
+section("10. a database predating identity_id fails loudly, not silently")
 legacy = os.path.join(tempfile.mkdtemp(), "legacy.db")
 _c = sqlite3.connect(legacy)
 _c.executescript("""CREATE TABLE objects(
@@ -198,20 +206,20 @@ _c.executescript("""CREATE TABLE objects(
   crop_path TEXT, lane_id TEXT, lane_flag TEXT, UNIQUE(run_id, track_id));
 INSERT INTO objects(id,run_id,track_id,cls_name) VALUES(1,1,7,'car');""")
 _c.commit(); _c.close()
-# Why this matters: _SQL now supplies 13 values for objects, and _commit()
+# Why this matters: _SQL supplies 13 values for objects, and _commit()
 # catches per BATCH - so without the guard an old file loses up to batch_rows
 # object rows per commit while the run looks healthy.
 try:
     SqliteStore(legacy)
-    check("opening a pre-vehicle_id database raises", False, "no error raised")
+    check("opening a pre-identity_id database raises", False, "no error raised")
 except RuntimeError as e:
-    check("opening a pre-vehicle_id database raises RuntimeError", True)
+    check("opening a pre-identity_id database raises RuntimeError", True)
     check("and the message says how to fix it",
-          "vehicle_id" in str(e) and ("Delete" in str(e) or "--db" in str(e)),
+          "identity_id" in str(e) and ("Delete" in str(e) or "--db" in str(e)),
           str(e)[:120])
 except Exception as e:
     # An OperationalError here means the guard runs too late: SCHEMA's
-    # CREATE INDEX ON objects(vehicle_id) fired first.
+    # CREATE INDEX ON objects(identity_id) fired first.
     check("the failure is the guard, not a raw sqlite error", False,
           f"{type(e).__name__}: {e}")
 check("the legacy rows are left untouched",
@@ -221,7 +229,7 @@ fresh_db = os.path.join(tempfile.mkdtemp(), "fresh.db")
 _fs = SqliteStore(fresh_db)
 _tables = {r[0] for r in _fs.connect_ro().execute(
     "SELECT name FROM sqlite_master WHERE type='table'")}
-check("a fresh database still gets the vehicles table", "vehicles" in _tables,
+check("a fresh database still gets the identities table", "identities" in _tables,
       str(sorted(_tables)))
 _fs.close()
 
@@ -232,12 +240,12 @@ check("enabled:false yields no resolver at all",
 section("12. identity state does not leak across evictions")
 ts = TrackStore()
 ts.touch(1, "car", 0.0, group="vehicle", conf=0.9)
-ts.vehicle_of[1], ts.plate_of[1] = 7, "HR26DK8337"
+ts.identity_of[1], ts.plate_of[1] = 7, "HR26DK8337"
 check("bound state is counted by state_size()", ts.state_size() >= 3,
       str(ts.state_size()))
 ts.evict_stale(now_s=9999.0, ttl_s=5.0)
 check("and is gone once the track is retired", ts.state_size() == 0,
-      f"leaked: vehicle_of={ts.vehicle_of} plate_of={ts.plate_of}")
+      f"leaked: identity_of={ts.identity_of} plate_of={ts.plate_of}")
 
 print(f"\n{'=' * 62}")
 print(f"{_passed} passed, {len(_failed)} failed")

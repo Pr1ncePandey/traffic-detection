@@ -1,11 +1,13 @@
-# Measured by tools/calibrate.py from samples/indian_road.mp4 (300 frames).
+# Measured by tools/calibrate.py from samples/short/indian_road.mp4 (300
+# frames). The dashboard source below is samples/long/, which is that same
+# clip concatenated - identical scene, so this geometry still applies.
 # Confirm the geometry once per CCTV before trusting wrong-way alerts from it.
 
 camera:
   name: "indian_road"
 
 video:
-  source: "samples/indian_road.mp4"
+  source: "samples/long/indian_road_long.mp4"
 
 analyses:
   counting:

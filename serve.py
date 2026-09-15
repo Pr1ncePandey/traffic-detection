@@ -13,16 +13,24 @@ There is NO application-level authentication. By decision, this service is
 protected by network placement only, so it binds to 127.0.0.1 by default and
 `--host 0.0.0.0` is an explicit act that prints a warning.
 
-That default matters more than it looks: `/crops/{id}.jpg` serves number-plate
-imagery and the WebSocket streams plate strings. Exposing this on an untrusted
-network publishes both. Put it behind a VPN or an authenticating reverse proxy
-before binding wider, and revisit the decision if this is ever operated by more
-than one person or handed to a client.
+That default matters more than it looks, and it matters more since the
+dashboard grew a video layer. Three things are published to anyone who can
+reach the port:
+
+  /crops/{id}.jpg       number-plate imagery
+  /live/{camera}        plate strings, as they are read
+  /stream/{camera}.mjpg LIVE ROAD FOOTAGE
+
+Put it behind a VPN or an authenticating reverse proxy before binding wider,
+and revisit the decision if this is ever operated by more than one person or
+handed to a client. `server.video.enabled: false` turns off the stream alone
+and leaves the rest of the dashboard working, if that is the trade you want.
 """
 
 import argparse
 import glob
 import os
+import sys
 
 DEFAULT_HOST = "127.0.0.1"       # never 0.0.0.0; see the module docstring
 DEFAULT_PORT = 8000
@@ -46,7 +54,8 @@ def parse_args():
     p.add_argument("--host", default=None,
                    help=f"listen address (default {DEFAULT_HOST}). There is no "
                         f"application auth, so widening this publishes plate "
-                        f"imagery and plate strings to whoever can reach it.")
+                        f"imagery, plate strings AND live video to whoever can "
+                        f"reach it.")
     p.add_argument("--port", type=int, default=None,
                    help=f"listen port (default {DEFAULT_PORT})")
     p.add_argument("--no-autostart", action="store_true",
@@ -61,6 +70,17 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # Line-buffer stdout. Redirected to a file (which is how a service is
+    # actually run) Python block-buffers it, so the camera threads' startup
+    # diagnostics sit in an 8 KB buffer and are LOST if the process is killed
+    # rather than shut down cleanly. That is how a real message -
+    # "[plate] paddle_anpr unavailable: missing ..." - stayed invisible while
+    # the dashboard showed an empty plate column.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     try:
         import uvicorn
     except ImportError:
@@ -82,11 +102,14 @@ def main():
     port = int(args.port or srv.get("port") or DEFAULT_PORT)
 
     if host not in ("127.0.0.1", "localhost", "::1"):
+        video_on = ((srv.get("video", {}) or {}).get("enabled", True))
         print(f"\n  WARNING: binding to {host}, not loopback.\n"
               f"  This service has NO application-level authentication. Anyone\n"
               f"  who can reach {host}:{port} can read number-plate imagery\n"
-              f"  (/crops/*.jpg) and live plate strings (/live/*). Put it behind\n"
-              f"  a VPN or an authenticating proxy.\n")
+              f"  (/crops/*.jpg) and live plate strings (/live/*)"
+              + (f",\n  and WATCH LIVE ROAD FOOTAGE (/stream/*.mjpg).\n"
+                 if video_on else ".\n")
+              + f"  Put it behind a VPN or an authenticating proxy.\n")
 
     print(f"[serve] cameras: {', '.join(cameras)}")
     print(f"[serve] dashboard http://{host}:{port}/  |  API docs /docs")

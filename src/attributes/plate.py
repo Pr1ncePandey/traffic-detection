@@ -35,7 +35,9 @@ REPAIR_CONF_DECAY = 0.9
 _lp_model = None
 _ocr_engine = None
 _cfg = {"det_conf": 0.3, "min_conf": 0.5, "det_imgsz": 480,
-        "ocr_backend": "paddle_anpr", "ocr_model": "",
+        # fast_plate, not paddle_anpr: pip installs it, so this default
+        # actually reads plates. See config.yaml for the full reasoning.
+        "ocr_backend": "fast_plate", "ocr_model": "",
         "format_correction": True, "join_rows": True,
         "read_every": 3, "max_reads": 8, "vote": True, "vote_min_conf": 0.8}
 

@@ -48,7 +48,7 @@ def policy(**overrides):
                                      "lat": 28.6139, "lon": 77.2090}})
 
 
-RETIRE = {"object_id": 137, "vehicle_id": 9,
+RETIRE = {"object_id": 137, "identity_id": 9, "identity_kind": "plate",
           "lane_id": "carriageway", "lane_flag": "wrong_way",
           "plate": "UP16PT9304", "plate_conf": 0.997,
           "cls_name": "car", "colour": "white",
@@ -82,7 +82,10 @@ check("a retiring wrong_way track raises exactly one incident", len(raised) == 1
       str(len(raised)))
 body = raised[0]["payload"]
 check("payload carries the plate", body["vehicle"]["plate"] == "UP16PT9304")
-check("payload carries the vehicle id", body["vehicle"]["vehicle_id"] == 9)
+check("payload carries the identity id", body["vehicle"]["identity_id"] == 9)
+check("and names the identity axis",
+      body["vehicle"]["identity_kind"] == "plate",
+      str(body["vehicle"].get("identity_kind")))
 check("payload carries camera lat/lon", body["camera"]["lat"] == 28.6139)
 check("state is 'closed' for a retired track", body["state"] == "closed")
 check("image_url is built from base_url, not the local crop path",
@@ -94,12 +97,13 @@ check("crop_path is NOT leaked to the consumer",
 print("\nabsence is explicit, not omitted")
 p = policy()
 bare = dict(RETIRE)
-for k in ("plate", "plate_conf", "vehicle_id", "crop_path"):
+for k in ("plate", "plate_conf", "identity_id", "identity_kind", "crop_path"):
     bare.pop(k, None)
 body = retire(p, detail=bare)[0]["payload"]
 check("plate key present even with no plate read", "plate" in body["vehicle"])
 check("...and its value is null", body["vehicle"]["plate"] is None)
-check("vehicle_id key present and null", body["vehicle"]["vehicle_id"] is None)
+check("identity_id key present and null",
+      body["vehicle"]["identity_id"] is None)
 check("image_url null when there is no crop", body["image_url"] is None)
 
 # --- evidence arrives before identity does -------------------------------

@@ -1,0 +1,38 @@
+query,relevant_object_ids,kind,notes
+# Layer 1b - open-vocabulary retrieval ground truth. See docs/vector-search.md.
+#
+# PROVENANCE MATTERS HERE, so it is recorded per row rather than assumed.
+#
+# The `carrying` rows are NOT hand-found. They were PROPOSED automatically:
+# the detector emits handbag/backpack/suitcase/umbrella as their own objects,
+# so a person box that contains an accessory box >=60% in the same frame is a
+# candidate positive. That turns labelling from searching 300 crops into
+# confirming 13. Spot-verified by eye: 238 (shoulder bag), 477 (bag at side),
+# 584 (blue plastic bag in both hands) - 3/3 correct. The remaining 10 are
+# unconfirmed proposals and the measurement says so.
+#
+# These rows are the ONLY ones here testing a RELATIONAL concept, which is the
+# thing open-vocabulary search exists for and the thing the attribute
+# vocabulary cannot express. They were written BEFORE running retrieval for
+# them, so the labels are not tuned to the model.
+#
+# WHY NOT THE person ENRICHER: it decodes HandBag/ShoulderBag/Backpack/
+# HoldObjectsInFront and was fetched and enabled for exactly this. On this
+# footage it confirmed 1 of these 16 proposals - it calls object 238
+# `bag=none` when the crop plainly shows a shoulder bag. At a person-crop
+# short side of ~47px it is below its useful range, so its labels are not
+# usable as ground truth here. Recorded because the negative result is worth
+# as much as a positive one would have been.
+"a person carrying a bag",212|215|238|418|472|477|517|576|584|619,positive,10 proposals; 238/477/584 eye-verified
+"a person holding an umbrella",212|239|247|517|557,positive,5 proposals from umbrella-box containment
+"a person carrying something",212|215|238|239|247|418|472|477|517|557|576|584|619,positive,union of both - the loosest relational form
+# Negative controls: COCO classes with ZERO detections in this database.
+# Derived by query, never assumed - person_test.mp4 contains `boat` and
+# `surfboard` detections, two classes that look obviously absent from a
+# pedestrian scene and are not.
+"a zebra",,negative,verified absent - no detection of this class in any run
+"a train",,negative,verified absent
+"an airplane",,negative,verified absent
+"an elephant",,negative,verified absent
+"a sheep",,negative,verified absent
+"a pizza",,negative,verified absent

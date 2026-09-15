@@ -34,10 +34,30 @@ Thumbs.db
 models/clothes_seg/
 models/MiVOLO/
 
+# CLIP / SigLIP encoders for open-vocabulary search. The *.onnx rule above
+# already covers the weights; these also carry a ~2MB tokenizer.json, and the
+# whole directory is reproducible with:
+#   python tools/fetch_clip.py --model clip-vit-b16
+models/clip_b16/
+models/clip_l14/
+models/clip/
+models/siglip/
+
 # Person-attribute test clips downloaded from YouTube: large, and not ours to
-# republish. Keep local.
-samples/person_test.mp4
-samples/person_test2.mp4
+# republish. Keep local. (Moved to samples/short/ in the brother-v3 layout.)
+samples/short/person_test.mp4
+samples/short/person_test2.mp4
+
+# Long soak-test videos for the dashboard (samples/README.md): 265-320 MB each,
+# over GitHub's 100 MB file limit, and person_test_long is built from the
+# YouTube clip above. Local only.
+samples/long/
 
 # Consented test footage of real people (faces + clothing). Never pushed.
 samples/model_test.mp4
+
+# Personal tool state that must not be shared: a Mac Finder archive folder,
+# an editor code-graph cache, and per-user Claude Code permissions.
+__MACOSX/
+.code-review-graph/
+.claude/settings.local.json

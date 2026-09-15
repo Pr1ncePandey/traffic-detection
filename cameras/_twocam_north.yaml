@@ -11,7 +11,7 @@ camera:
   location: {lat: 12.9716, lon: 77.5946}
 
 video:
-  source: "samples/indian_road.mp4"
+  source: "samples/short/indian_road.mp4"
   # The two cameras are anchored 5 minutes apart, so a car at clip-second
   # 12.4 lands at 08:00:12.4 here and 08:05:12.4 at the other camera - a
   # clean 300 s hop over ~3.5 km, i.e. ~42 km/h. Well under max_speed_kmh.

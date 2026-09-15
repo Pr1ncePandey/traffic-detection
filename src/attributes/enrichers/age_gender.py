@@ -108,7 +108,7 @@ class AgeGenderEnricher:
 
     def apply(self, ctx, findings: Findings):
         for tid, fields in findings.per_track.items():
-            obj = ctx.store.vehicles.get(tid)
+            obj = ctx.store.tracks.get(tid)
             if obj is not None:
                 obj.setdefault("attrs", {}).update(fields.get("extra") or {})
 

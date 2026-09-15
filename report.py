@@ -51,9 +51,15 @@ def main():
     totals = conn.execute(
         "SELECT COUNT(*) tracks, SUM(frames_seen) sightings FROM objects").fetchone()
     frames_n = conn.execute("SELECT COUNT(*) n FROM frames").fetchone()["n"]
-    # The actual event names the pipeline writes.
+    # The actual crossing names the pipeline writes. Read from `events`, not
+    # from a detections.event column: that column was the weaker of two copies
+    # of the same fact (detections is _SHEDDABLE, events is not) and is gone.
+    # counting.py emits kind='crossing' with the direction in detail_json.
     crossings = {r["event"]: r["n"] for r in conn.execute(
-        "SELECT event, COUNT(*) n FROM detections WHERE event <> '' GROUP BY event")}
+        "SELECT json_extract(detail_json, '$.direction') event, COUNT(*) n"
+        " FROM events WHERE kind='crossing'"
+        "   AND json_extract(detail_json, '$.direction') IS NOT NULL"
+        " GROUP BY 1")}
     by_class = conn.execute(
         "SELECT cls_group, cls_name, COUNT(*) n FROM objects"
         " GROUP BY cls_group, cls_name ORDER BY n DESC").fetchall()
@@ -66,16 +72,17 @@ def main():
     # ends up referencing, and counting rows would report a car that was never
     # actually seen. DISTINCT over the FK is the number that cannot be wrong.
     vehicles = conn.execute(
-        "SELECT COUNT(DISTINCT vehicle_id) n FROM objects"
-        " WHERE vehicle_id IS NOT NULL").fetchone()["n"]
+        "SELECT COUNT(DISTINCT identity_id) n FROM objects"
+        " WHERE identity_id IS NOT NULL").fetchone()["n"]
     # Sightings that resolved to a vehicle, and the re-entries among them: a
     # vehicle with more than one objects row is precisely a car this system
     # used to count twice.
     linked = conn.execute(
-        "SELECT COUNT(*) n FROM objects WHERE vehicle_id IS NOT NULL").fetchone()["n"]
+        "SELECT COUNT(*) n FROM objects"
+        " WHERE identity_id IS NOT NULL").fetchone()["n"]
     returning = conn.execute(
-        "SELECT COUNT(*) n FROM (SELECT vehicle_id FROM objects"
-        " WHERE vehicle_id IS NOT NULL GROUP BY vehicle_id"
+        "SELECT COUNT(*) n FROM (SELECT identity_id FROM objects"
+        " WHERE identity_id IS NOT NULL GROUP BY identity_id"
         " HAVING COUNT(*) > 1)").fetchone()["n"]
     events = conn.execute(
         "SELECT kind, COUNT(*) n FROM events GROUP BY kind ORDER BY n DESC").fetchall()
@@ -103,7 +110,7 @@ def main():
         cards.append(f'''<div class="card{' bad' if 'wrong' in flag else ''}">
   {img}
   <div class="meta">
-    <b>#{r["id"]}</b> {("V" + str(r["vehicle_id"])) if r["vehicle_id"] is not None else "track " + str(r["track_id"])} &middot; {html.escape(r["cls_name"] or "?")}
+    <b>#{r["id"]}</b> {("V" + str(r["identity_id"])) if r["identity_id"] is not None else "track " + str(r["track_id"])} &middot; {html.escape(r["cls_name"] or "?")}
     <span class="grp">{html.escape(r["cls_group"] or "")}</span><br>
     seen {r["frames_seen"]}x, {(r["first_seen_s"] or 0):.1f}s &rarr; {(r["last_seen_s"] or 0):.1f}s<br>
     conf {(r["best_conf"] or 0):.2f} &middot; lane {html.escape(str(r["lane_id"] or "-"))}

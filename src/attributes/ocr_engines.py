@@ -250,22 +250,49 @@ BACKENDS = {
 }
 
 
+# Why plate reading is or is not working, as STATE rather than only a print.
+#
+# A print is enough for `main.py`, where a human is watching the terminal. It
+# is not enough for `serve.py`: stdout is redirected, the message scrolls past
+# at startup, and the operator meets the consequence hours later as an empty
+# plate column on the dashboard with nothing saying why. A silently degraded
+# feed is exactly the failure this project surfaces health tiles for, and an
+# OCR backend that failed to load is the same class of problem.
+#
+# Module-level because the engine itself is a module-level singleton (see
+# plate.py). With N cameras on one backend - the normal case - this describes
+# all of them. Two cameras on DIFFERENT backends would leave this reporting
+# whichever initialised last, which is worth knowing before relying on it.
+STATUS: dict = {"backend": None, "ok": False, "error": None}
+
+
+def status() -> dict:
+    """Snapshot of plate-OCR availability, for /cameras and the dashboard."""
+    return dict(STATUS)
+
+
 def get_engine(backend: str, model: str = "", join_rows: bool = True):
     """Build a backend, or return None after explaining why it is unavailable.
 
     None (never an exception) keeps plate reading optional: a missing OCR
     dependency must not stop vehicle counting.
     """
+    STATUS.update(backend=backend, ok=False, error=None)
     cls = BACKENDS.get(backend)
     if cls is None:
-        print(f"[plate] unknown ocr_backend {backend!r}; "
-              f"choose one of {sorted(BACKENDS)}")
+        msg = f"unknown ocr_backend {backend!r}; choose one of {sorted(BACKENDS)}"
+        print(f"[plate] {msg}")
+        STATUS["error"] = msg
         return None
     try:
         engine = cls(model=model, join_rows=join_rows)
     except Exception as e:
+        # The message carries fetch instructions for the paddle backend, so it
+        # is kept whole rather than summarised - it is the actionable part.
         print(f"[plate] {backend} unavailable: {e}")
+        STATUS["error"] = f"{backend} unavailable: {e}"
         return None
     print(f"[plate] OCR backend: {backend}"
           + (f" ({model})" if model else ""))
+    STATUS["ok"] = True
     return engine

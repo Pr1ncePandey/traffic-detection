@@ -283,7 +283,7 @@ class PersonEnricher:
         """The one shared write: the object's durable attribute record."""
         store = ctx.store
         for tid, fields in findings.per_track.items():
-            obj = store.vehicles.get(tid)
+            obj = store.tracks.get(tid)
             if obj is None:
                 continue
             attrs = obj.setdefault("attrs", {})

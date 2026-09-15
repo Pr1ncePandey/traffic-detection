@@ -99,12 +99,12 @@ appmod.load_for_camera = _patched
 con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
 CAM = (con.execute("SELECT camera FROM runs WHERE camera<>'' LIMIT 1").fetchone()
        or ["indian_road"])[0]
-row = con.execute("SELECT id FROM vehicles LIMIT 1").fetchone()
-VEHICLE = row[0] if row else None
+row = con.execute("SELECT id FROM identities WHERE kind='plate' LIMIT 1").fetchone()
+IDENTITY = row[0] if row else None
 row = con.execute("SELECT object_id FROM objects o JOIN attributes a"
                   " ON a.object_id=o.id LIMIT 1").fetchone()
 OBJECT = row[0] if row else None
-print(f"camera={CAM!r} vehicle={VEHICLE} object={OBJECT}")
+print(f"camera={CAM!r} identity={IDENTITY} object={OBJECT}")
 
 app = appmod.create_app([CAM], config_path="config.yaml", autostart=False)
 
@@ -182,22 +182,31 @@ with TestClient(app) as client:
           isinstance(y.get("runs_without_location"), int),
           str(y.get("runs_without_location")))
 
-    print("\nvehicles and journeys")
-    if VEHICLE is None:
-        check("no vehicles in this DB, so 404 is correct",
-              client.get("/vehicles/1").status_code == 404,
+    print("\nidentities and journeys")
+    lst = client.get("/identities")
+    check("GET /identities is 200", lst.status_code == 200, str(lst.status_code))
+    check("it returns an identities list", "identities" in lst.json(),
+          str(sorted(lst.json().keys())))
+    if IDENTITY is None:
+        check("no identities in this DB, so 404 is correct",
+              client.get("/identities/1").status_code == 404,
               "run with plate reading on to exercise the populated path")
     else:
-        r = client.get(f"/vehicles/{VEHICLE}")
-        check(f"GET /vehicles/{VEHICLE} is 200", r.status_code == 200,
+        r = client.get(f"/identities/{IDENTITY}")
+        check(f"GET /identities/{IDENTITY} is 200", r.status_code == 200,
               str(r.status_code))
-        check("it returns the plate", "plate" in str(r.json()))
-        p = client.get(f"/vehicles/{VEHICLE}/path")
+        body = r.json().get("identity") or {}
+        check("it returns the plate", body.get("plate") is not None, str(body))
+        check("and names the axis", body.get("kind") == "plate", str(body))
+        p = client.get(f"/identities/{IDENTITY}/path")
         check("GET .../path is 200", p.status_code == 200, str(p.status_code))
-    check("an unknown vehicle is 404",
-          client.get("/vehicles/99999999").status_code == 404)
-    check("an unknown vehicle path is 404",
-          client.get("/vehicles/99999999/path").status_code == 404)
+    check("an unknown identity is 404",
+          client.get("/identities/99999999").status_code == 404)
+    check("an unknown identity path is 404",
+          client.get("/identities/99999999/path").status_code == 404)
+    check("the old /vehicles route is gone",
+          client.get("/vehicles").status_code == 404,
+          str(client.get("/vehicles").status_code))
 
     print("\ncrop imagery")
     check("a missing crop is 404, not a traceback",
@@ -211,9 +220,9 @@ with TestClient(app) as client:
           client.post("/cameras/nope/start").status_code == 404)
 
     print("\nbad input is rejected, not crashed")
-    check("a non-numeric vehicle id is a 422",
-          client.get("/vehicles/abc").status_code == 422,
-          str(client.get("/vehicles/abc").status_code))
+    check("a non-numeric identity id is a 422",
+          client.get("/identities/abc").status_code == 422,
+          str(client.get("/identities/abc").status_code))
     check("a negative limit does not 500",
           client.get("/events?limit=-5").status_code in (200, 422),
           str(client.get("/events?limit=-5").status_code))

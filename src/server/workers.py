@@ -47,17 +47,34 @@ IDLE, STARTING, RUNNING, RETRYING, FAILED, STOPPING, STOPPED = (
     "idle", "starting", "running", "retrying", "failed", "stopping", "stopped")
 
 
+def _plate_ocr_status() -> dict:
+    """Whether plate reading actually loaded. Never raises.
+
+    Imported inside the function because the attributes package pulls in
+    onnxruntime and friends, and a status call must not be the thing that
+    triggers that import.
+    """
+    try:
+        from ..attributes import ocr_engines
+        return ocr_engines.status()
+    except Exception:
+        return {"backend": None, "ok": False, "error": None}
+
+
 class CameraWorker:
     """Runs one camera's pipeline on a thread, and keeps it running."""
 
     def __init__(self, camera_id: str, cfg: dict, hub=None, policy=None,
                  config_path: str = "config.yaml",
-                 max_restarts: int = MAX_RESTARTS, storage=None):
+                 max_restarts: int = MAX_RESTARTS, storage=None, video=None):
         self.camera_id = camera_id
         self.cfg = cfg
         self.config_path = config_path
         self.hub = hub
         self.policy = policy
+        # The JPEG fan-out. Separate from `hub` because the two channels are
+        # separate on purpose: metadata stays data, pixels stay pixels.
+        self.video = video
         # The server's single shared SqliteStore. See run_pipeline's docstring
         # for why this is passed in rather than constructed per camera.
         self.storage = storage
@@ -105,8 +122,14 @@ class CameraWorker:
         alive = self._thread.is_alive()
         if not alive:
             self.state = STOPPED
+            # Both channels, or the dashboard keeps showing a stopped camera's
+            # final frame with its final boxes on top - indistinguishable from
+            # a running feed that has frozen, which is the failure this whole
+            # class exists to make visible.
             if self.hub is not None:
                 self.hub.forget(self.camera_id)
+            if self.video is not None:
+                self.video.forget(self.camera_id)
         return not alive
 
     @property
@@ -165,6 +188,11 @@ class CameraWorker:
                                           "max_age_hours": 0, "max_disk_gb": 0}
         run_pipeline(cfg, stop=self._stop, on_frame=self._on_frame,
                      on_event=self._on_event, on_ready=self._on_ready,
+                     # Passed as None when there is no sink, so the frame loop
+                     # does not even make the call - `main.py` pays nothing for
+                     # a feature only the server uses.
+                     on_video=(self._on_video if self.video is not None
+                               else None),
                      storage=self.storage,
                      # N cameras redrawing a tqdm bar into one log is
                      # unreadable, and a restarted camera would start a fresh
@@ -189,6 +217,15 @@ class CameraWorker:
             meta["congestion"] = self.policy.congestion_state(self.camera_id)
         if self.hub is not None:
             self.hub.publish(meta)
+
+    def _on_video(self, frame):
+        """Hand the clean frame to the sink, which decides whether to encode.
+
+        Deliberately thin: the throttle and the is-anyone-watching check live
+        in the sink, so this runs at full frame rate and costs a dict lookup
+        when nobody has the dashboard open.
+        """
+        self.video.offer(self.camera_id, frame)
 
     def _tick_fps(self):
         """Achieved fps over a rolling ~2 s window.
@@ -232,6 +269,14 @@ class CameraWorker:
             "seconds_since_frame": stale,
             "location": (self.cfg.get("camera", {}) or {}).get("location"),
             "viewers": self.hub.viewers(self.camera_id) if self.hub else 0,
+            # Plate OCR availability, so an empty plate column on the
+            # dashboard explains itself instead of looking like a bug. Read
+            # lazily rather than cached: the engine initialises on the first
+            # frame that has a plate box, not at startup.
+            "plate_ocr": _plate_ocr_status(),
+            "video_viewers": (self.video.viewers(self.camera_id)
+                              if self.video else 0),
+            "video_age_s": self.video.age(self.camera_id) if self.video else None,
             "counts": (meta or {}).get("counts", {}),
             "crossings": (meta or {}).get("crossings", {}),
             "flagged": (meta or {}).get("flagged", {}),
@@ -244,11 +289,12 @@ class WorkerPool:
     """Every configured camera, and the control plane over them."""
 
     def __init__(self, camera_ids, config_path: str = "config.yaml",
-                 hub=None, policy=None, storage=None):
+                 hub=None, policy=None, storage=None, video=None):
         self.config_path = config_path
         self.hub = hub
         self.policy = policy
         self.storage = storage
+        self.video = video
         self.workers: dict[str, CameraWorker] = {}
         for camera_id in camera_ids:
             try:
@@ -258,7 +304,7 @@ class WorkerPool:
                 continue
             self.workers[camera_id] = CameraWorker(
                 camera_id, cfg, hub=hub, policy=policy, config_path=config_path,
-                storage=storage)
+                storage=storage, video=video)
 
     def locations(self) -> dict:
         """camera id -> {name, lat, lon}, for stamping incident payloads."""

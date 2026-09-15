@@ -133,7 +133,7 @@ def build_samples() -> list:
 
     def retire(tid, oid, flag, ts, plate=None, conf=0.0, vid=None, colour=None):
         return {"kind": "track_retired", "track_id": tid, "ts": ts, "detail": {
-            "object_id": oid, "vehicle_id": vid, "plate": plate,
+            "object_id": oid, "identity_id": vid, "plate": plate,
             "plate_conf": conf, "cls_name": "car", "colour": colour,
             "first_seen_s": round(ts - 6.4, 2), "last_seen_s": ts, "frames_seen": 160,
             "crop_path": f"outputs/crops/{oid}.jpg", "lane_id": "carriageway",

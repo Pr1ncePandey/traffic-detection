@@ -11,16 +11,18 @@ TWO LEVELS, AND THE DIFFERENCE IS THE POINT
   track / object   one SIGHTING. Still one `objects` row per track, exactly as
                    before, so throughput counting is untouched: a vehicle that
                    legitimately passes twice really did pass twice.
-  vehicle          one ENTITY, keyed on the plate. Several `objects` rows point
-                   at it via objects.vehicle_id.
+  identity         one ENTITY, keyed on the plate (identities.kind='plate').
+                   Several `objects` rows point at it via objects.identity_id.
+                   The table is class-agnostic, so an appearance-clustered
+                   person will be a second `kind` in the same table.
 
 Splitting them rather than re-using the object id is what makes this cheap.
 The plate is NOT known when a track is born - with read_every=3/max_reads=8 it
 takes ~24 frames with a readable plate box, and plate._consensus() only votes
 once there are three reads above vote_min_conf. Re-using the object id would
 mean buffering every detection row until the plate resolved, or rewriting rows
-afterwards. Attaching a vehicle id instead means detections.object_id is never
-rewritten - identity lands at finalize time, when voting is already done.
+afterwards. Attaching an identity id instead means detections.object_id is
+never rewritten - identity lands at finalize time, when voting is already done.
 
 MEMORY: the cache is an LRU with a hard cap. A busy road produces unboundedly
 many plates, and preloading the table (or never evicting) is the same bug this
@@ -30,10 +32,15 @@ confident read in this process.
 """
 
 from collections import OrderedDict
+from functools import partial
 
 from ..attributes.plate_format import normalize
 
 CACHE_SIZE = 4096
+
+# The identity axis this resolver binds. identities.kind is open - an appearance
+# cluster will be 'person_reid' - but a plate resolver only ever writes this one.
+KIND_PLATE = "plate"
 
 
 class PlateIdentity:
@@ -74,8 +81,8 @@ class PlateIdentity:
         self.errors = 0
 
     # --- cache -------------------------------------------------------------
-    def _remember(self, plate: str, vehicle_id: int):
-        self._cache[plate] = vehicle_id
+    def _remember(self, plate: str, identity_id: int):
+        self._cache[plate] = identity_id
         self._cache.move_to_end(plate)
         while len(self._cache) > self.cache_size:
             self._cache.popitem(last=False)
@@ -156,7 +163,7 @@ class PlateIdentity:
         self._remember(key, int(vid))
         return int(vid)
 
-    def _touched(self, plate: str, vehicle_id: int, ts: float):
+    def _touched(self, plate: str, identity_id: int, ts: float):
         """Let storage advance the vehicle's last-seen window on a reuse.
 
         Reuse is the whole point of this class and it never calls create(), so
@@ -167,7 +174,7 @@ class PlateIdentity:
         if self._touch is None:
             return
         try:
-            self._touch(vehicle_id, plate, ts)
+            self._touch(identity_id, plate, ts)
         except Exception as e:
             self.errors += 1
             print(f"[identity] touch failed for {plate}: {e}")
@@ -198,12 +205,20 @@ def from_config(cfg: dict, storage=None) -> "PlateIdentity | None":
         return None
     lookup = create = touch = None
     if storage is not None:
-        lookup = getattr(storage, "lookup_vehicle", None)
-        create = getattr(storage, "create_vehicle", None)
-        touch = getattr(storage, "touch_vehicle", None)
-        if lookup is None or create is None:
-            print("[identity] storage cannot persist vehicles; re-id disabled")
+        # The store's identity methods are generic over `kind`; the plate axis
+        # is bound HERE rather than inside them, so adding kind='person_reid'
+        # later is a second wiring and not a change to storage.
+        s_lookup = getattr(storage, "lookup_identity", None)
+        s_create = getattr(storage, "create_identity", None)
+        s_touch = getattr(storage, "touch_identity", None)
+        if s_lookup is None or s_create is None:
+            print("[identity] storage cannot persist identities; re-id disabled")
             return None
+        lookup = partial(s_lookup, KIND_PLATE)
+        create = partial(s_create, KIND_PLATE)
+        if s_touch is not None:
+            def touch(identity_id, key, ts):
+                s_touch(identity_id, KIND_PLATE, key, ts)
     return PlateIdentity(lookup=lookup, create=create, touch=touch,
                          cache_size=int(rc.get("cache_size") or CACHE_SIZE),
                          fuzzy_distance=int(rc.get("fuzzy_distance") or 0))

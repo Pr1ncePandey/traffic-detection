@@ -1,6 +1,6 @@
 """Side-by-side test: PP-Human vs SegFormer garments vs MiVOLO age/gender.
 
-    python tools/eval_person_models.py --video samples/person_test2.mp4 \
+    python tools/eval_person_models.py --video samples/short/person_test2.mp4 \
         --csv outputs/person_attr_eval_person_test2/tracks_umb.csv \
         --out outputs/person_models_person_test2
 
@@ -79,7 +79,7 @@ def main():
         enough = rows_per_track[rows_per_track >= min_reads * read_every].index
         keep = tallest.loc[enough].sort_values(ascending=False).head(args.max_people).index
         people = people[people.object_id.isin(keep)]
-    umb = df[df.vehicle_class == "umbrella"]
+    umb = df[df.cls_name == "umbrella"]
     by_frame = {f: g for f, g in people.groupby("frame")}
     umb_by = {f: [tuple(int(v) for v in r) for r in g[["x1", "y1", "x2", "y2"]]
                   .itertuples(index=False)] for f, g in umb.groupby("frame")}

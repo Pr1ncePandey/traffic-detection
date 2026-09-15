@@ -38,17 +38,20 @@ rapidocr-onnxruntime<2   # <2 matters: 2.x renamed the package and changed its r
 # ---------------------------------------------------------------------------
 # HEADS UP: the DEFAULT backend is NOT installed by this file.
 #
-# config.yaml, src/config.py and src/attributes/plate.py all default
-# plate.ocr_backend to "paddle_anpr", and it needs three things this file
-# cannot provide - a paddle wheel, ~150MB of weights, and a PaddleOCR source
-# checkout that ppocr is imported from. So `pip install -r requirements.txt`
-# alone leaves plate reading OFF, with:
+# plate.ocr_backend defaults to "fast_plate", which this file DOES install, so
+# plate reading works on a clean `pip install -r requirements.txt`.
+#
+# It used to default to "paddle_anpr", which is more accurate (CER 0.19 vs
+# 0.54) but needs three things pip cannot provide - a paddle wheel, ~150MB of
+# weights, and a PaddleOCR source checkout that ppocr is imported from. The
+# result was that a clean install read NO plates, announcing itself only as:
 #
 #   [plate] paddle_anpr unavailable: PaddleOCR checkout not found.
 #
 # That is graceful - detection, tracking, counting, lanes and congestion all
-# still run - but no plates are read, which also means no plate-keyed vehicle
-# re-identification (see `reid:` in config.yaml). Either complete the install:
+# still run - but it also meant no plate-keyed re-identification, and on the
+# dashboard it looked like an empty column rather than a missing dependency.
+# Hence the swap. To use the more accurate backend, complete the install:
 #
 #   pip install paddlepaddle safetensors scikit-image
 #   mkdir -p models/anpr_ocr && cd models/anpr_ocr
@@ -56,6 +59,9 @@ rapidocr-onnxruntime<2   # <2 matters: 2.x renamed the package and changed its r
 #   curl -LO https://huggingface.co/Awiros/anpr-ocr/resolve/main/en_dict.txt
 #   cd ../.. && git clone --depth 1 \
 #       https://github.com/PaddlePaddle/PaddleOCR.git models/PaddleOCR
+#
+# ...then set plate.ocr_backend: "paddle_anpr" in config.yaml. `/cameras`
+# reports which backend actually loaded, and the dashboard banners a failure.
 #
 # ...or switch to a backend this file does install:
 #

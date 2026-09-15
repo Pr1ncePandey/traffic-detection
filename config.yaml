@@ -31,7 +31,7 @@ camera:
 video:
   # A camera normally declares its own `source` in cameras/<id>.yaml, so its
   # geometry cannot be paired with the wrong footage. --source overrides.
-  source: "samples/input.mp4"
+  source: "samples/short/input.mp4"
   target: "outputs/{camera_id}/annotated.mp4"
   csv: "outputs/{camera_id}/tracks.csv"
   summary: "outputs/{camera_id}/summary.txt"
@@ -104,14 +104,26 @@ perception:
       det_imgsz: 480     # detector size. Lower = faster, misses small plates.
 
       # WHICH READER. Compare them yourself: python tools/bench_ocr.py
-      #   paddle_anpr - DEFAULT. Trained on Indian plates, two-row (bike)
-      #                 plates included. Needs the extra install in the README;
-      #                 without it plate reading is empty and says so.
-      #   fast_plate  - plate-specific, tiny and fastest. Nothing to download.
+      #   fast_plate  - THE DEFAULT HERE. Plate-specific, tiny, fastest, and
+      #                 nothing to download: it ships with the pip install.
+      #   paddle_anpr - more accurate, and the better choice IF you install it.
+      #                 Needs three things pip cannot provide (see the note at
+      #                 the bottom of requirements.txt): paddlepaddle +
+      #                 safetensors + scikit-image, ~150 MB of weights, and a
+      #                 PaddleOCR source checkout.
       #   rapidocr    - generic text reader. Fallback only; far the weakest.
       # Character error rate on samples/plate_gt.csv (5 plates, lower better):
       #   paddle_anpr 0.19  |  fast_plate 0.54  |  rapidocr 0.88
-      ocr_backend: "paddle_anpr"
+      #
+      # WHY THE DEFAULT IS NOT THE MOST ACCURATE ONE. paddle_anpr was the
+      # default and is not installable by `pip install -r requirements.txt`,
+      # so out of the box it failed to load and NO plates were read - on the
+      # dashboard that appeared as an empty plate column with no explanation.
+      # Defaulting to the backend that works means plate reading is on for
+      # anyone who just clones and runs. Switch to paddle_anpr once installed;
+      # `/cameras` reports which backend actually loaded, and the dashboard
+      # shows a banner when it did not.
+      ocr_backend: "fast_plate"
       ocr_model: ""      # backend-specific model name. "" = that backend's default.
 
       # HOW MANY FRAMES TO READ PER VEHICLE. The plate is biggest the moment it
@@ -203,7 +215,7 @@ analyses:
       color_b: [0, 255, 255]
 
   # WRONG-SIDE DETECTION ----------------------------------------------------
-  # This used to carry two polygons hand-tuned on samples/input.mp4, and every
+  # This used to carry two polygons hand-tuned on samples/short/input.mp4, and every
   # other source silently inherited them. On Indian test footage that divider
   # cut through the middle of a single one-way carriageway: 2 of 90 vehicle
   # tracks were reported wrong-way, both driving correctly. So the default is
@@ -391,3 +403,83 @@ journey:                 # MULTI-CAMERA ROUTES (offline; see src/journeys.py)
                          # would leave a plausible-looking route with no sign
                          # that its identity is wrong. Needs camera.location at
                          # both ends; without it a hop cannot be speed-checked.
+
+server:                  # THE SERVICE (serve.py). Fleet-wide: a camera file
+                         # cannot move the listen address out from under you.
+  # There is NO application-level authentication, by decision. This is
+  # protected by network placement only, and three endpoints make that
+  # decision matter: /crops serves plate imagery, /live streams plate strings,
+  # and /stream serves live road footage. Binding wider publishes all three.
+  host: 127.0.0.1        # never 0.0.0.0 by default. --host says so out loud.
+  port: 8000
+  push_hz: 8             # metadata WebSocket rate, independent of
+                         # processing.analyse_fps. Nobody reads 30 updates a
+                         # second, and a file replaying at 3x would flood it.
+  video:
+    # The MJPEG stream the dashboard draws its boxes over. The boxes stay
+    # DATA on the WebSocket above rather than being burnt into these frames,
+    # which is what lets them be toggled, filtered and clicked.
+    #
+    # enabled: false keeps the whole dashboard working and serves no pixels -
+    # that is the pre-video behaviour, if the exposure is not one you want.
+    enabled: true
+    fps: 8               # encode ceiling. Independent of analyse_fps again:
+                         # a clip replaying at 3x should not encode 90 fps for
+                         # a viewer who can see eight.
+    quality: 70          # JPEG quality. MEASURED on samples/short/indian_road.mp4
+                         # (1080p, busy scene): 960 px at 70 is ~83 KB a frame,
+                         # so ~4.3 Mbit/s per viewer at 8 fps. Drop this or
+                         # max_width if that matters; a quiet scene costs far
+                         # less, because JPEG size follows detail.
+    max_width: 960       # downscale ceiling. ASPECT RATIO IS PRESERVED and
+                         # has to be: the dashboard overlays a canvas sized to
+                         # the camera's SOURCE resolution and lets CSS stretch
+                         # both to one box, so a non-proportional resize would
+                         # put every box a few pixels off its object.
+    snapshot_fps: 1      # cadence when NOBODY is streaming. Encoding is
+                         # skipped almost entirely with no viewers, but not
+                         # completely, or /snapshot.jpg would serve whatever
+                         # was current when the last tab closed.
+  search:
+    # OPEN-VOCABULARY SEARCH over embedded crops (the dashboard's search view).
+    #
+    # `model` is the single place the embedding space is named. It used to be
+    # a constant in the server while tools/embed_crops.py defaulted to
+    # something else, so running the embedder with no flags filled a space
+    # nothing queried and search returned nothing with no error. Cosine is
+    # only meaningful WITHIN one space, so two indexes can never cover for
+    # each other - one name, here.
+    model: "clip-vit-l14"    # or clip-vit-b16 (faster, lower p@5)
+
+    # Embeddings are NOT built by the pipeline - no real-time decision needs
+    # one, and keeping CLIP out of pipeline.py makes a model swap a script
+    # re-run. The cost used to be a trap: a fresh database meant search
+    # returned nothing until someone remembered to run the embedder by hand.
+    # So the service indexes its own backlog on a thread, like the webhook
+    # dispatcher and the retention reaper.
+    #
+    # OFF in this checkout: CLIP L/14 is ~317 ms/crop and competes for the same
+    # CPU as recognition, plates and attributes on this laptop, so it stays off
+    # while those are being run and tested (agreed with the brother). Turn it
+    # back on here to index crops for search, or run tools/embed_crops.py by
+    # hand when the machine is otherwise idle.
+    embed_in_background: false
+
+    # THE DUTY CYCLE, which is the whole safety mechanism. L/14 inference is
+    # ~317 ms/crop on CPU and the cameras want that CPU, so this works in
+    # bursts and then deliberately waits:
+    #
+    #     duty = work / (work + pause_s),  work ~= batch * 0.32s for L/14
+    #
+    # 8 and 3.0 give ~45%, about 1.4 crops/s against the CLI's 3.1. That is
+    # intentionally slower: a backlog nobody is waiting on must not cost the
+    # live feeds frame rate. pause_s: 0 runs flat out.
+    batch: 8
+    pause_s: 3.0
+    idle_poll_s: 30        # how often to look for new crops once caught up
+
+    # Which crops are eligible. Same floors as the CLI (shared code in
+    # src/query/embed.py), each one a measurement decision - see that module.
+    min_px: 48             # short side below this carries too few pixels
+    min_conf: 0.5          # detection confidence of the crop's own frame
+    max_area: 0.33         # a near-frame-sized box is the scene, not an object

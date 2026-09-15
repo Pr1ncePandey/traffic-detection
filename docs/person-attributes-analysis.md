@@ -1,5 +1,12 @@
 # Person attributes — analysis and decision log
 
+> **Paths note (2026-09-15):** the brother-v3 merge moved sample footage into
+> `samples/short/` and `samples/long/`. The clips named below as
+> `samples/indian_road.mp4`, `samples/person_test.mp4` and
+> `samples/person_test2.mp4` now live in `samples/short/`. `person_test.mp4`
+> there is the trimmed version (title cards removed); the field-test results in
+> this document were measured on the untrimmed file.
+
 This records why the `person`, `garments` and `age_gender` enrichers exist,
 what was tried, what worked, and what didn't. It exists so the reasoning
 survives even if the person who asked for it isn't in the room — read this

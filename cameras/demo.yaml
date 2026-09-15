@@ -1,4 +1,4 @@
-# Demo camera for samples/input.mp4 (1280x720): a dual carriageway split by a
+# Demo camera for samples/short/input.mp4 (1280x720): a dual carriageway split by a
 # white fence, seen from a footbridge. The NEAR road (right of the fence) runs
 # away from the camera; the FAR road (left of it) comes towards the camera.
 #
@@ -38,7 +38,7 @@ camera:
 video:
   # The camera owns its source, so this geometry cannot be applied to the
   # wrong footage by accident.
-  source: "samples/input.mp4"
+  source: "samples/short/input.mp4"
 
   # When this footage was shot. Unset for the same reason as `location`: the
   # sample's real recording time is unknown. Without it this run's timestamps

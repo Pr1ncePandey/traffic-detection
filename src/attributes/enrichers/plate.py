@@ -7,7 +7,7 @@ an object, not a conclusion about traffic.
 This is the one plugin where parallelism actually pays - plate detection plus
 OCR is tens of milliseconds of ONNX per frame, and it releases the GIL. What
 used to prevent that was not the phase split but WHERE THE STATE LIVED: reads
-accumulated in `store.vehicles[tid]`, so OCR mutated shared tracker state. The
+accumulated in `store.tracks[tid]`, so OCR mutated shared tracker state. The
 reads now live here, in `self._reads`, and `apply()` does the one shared write.
 
 Gated on group == "vehicle", which is the point of the class taxonomy: with all
@@ -77,16 +77,16 @@ class PlateEnricher:
     def apply(self, ctx, findings: Findings):
         """The one shared write: the object's durable attribute record.
 
-        pipeline._finalize persists from store.vehicles[tid]["attrs"], so this
+        pipeline._finalize persists from store.tracks[tid]["attrs"], so this
         is what makes a plate outlive the track that read it.
         """
         store = ctx.store
         for tid, fields in findings.per_track.items():
             extra = fields.get("extra") or {}
-            vehicle = store.vehicles.get(tid)
-            if vehicle is None or "plate_number" not in extra:
+            track = store.tracks.get(tid)
+            if track is None or "plate_number" not in extra:
                 continue
-            attrs = vehicle.setdefault("attrs", {})
+            attrs = track.setdefault("attrs", {})
             attrs["plate_number"] = extra["plate_number"]
             attrs["plate_conf"] = round(float(extra.get("plate_conf", 0.0)), 3)
 

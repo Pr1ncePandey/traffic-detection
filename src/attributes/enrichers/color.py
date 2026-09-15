@@ -101,10 +101,10 @@ class ColorEnricher:
         """The one shared write: the object's durable attribute record."""
         store = ctx.store
         for tid, fields in findings.per_track.items():
-            vehicle = store.vehicles.get(tid)
-            if vehicle is None:
+            track = store.tracks.get(tid)
+            if track is None:
                 continue
-            attrs = vehicle.setdefault("attrs", {})
+            attrs = track.setdefault("attrs", {})
             for key, value in (fields.get("extra") or {}).items():
                 attrs[key] = value
 
