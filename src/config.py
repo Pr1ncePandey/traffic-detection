@@ -66,7 +66,8 @@ NOTED_KEYS = (
 # storage.path is deliberately NOT here: the database is shared by design.
 _PATH_KEYS = ("video.target", "video.csv", "video.summary",
               "frames.dir", "objects.crop_dir",
-              "perception.attributes.face.snapshot_dir")
+              "perception.attributes.face.snapshot_dir",
+              "analyses.heatmap.dir")
 
 DEFAULTS = {
     # Identity. `id` is the cameras/<id>.yaml stem and the {camera_id} used in
@@ -160,6 +161,16 @@ DEFAULTS = {
     # run order for the serial phases; each has its own `enabled` so a camera
     # can switch one off without touching the others.
     "analyses": {
+        # First on purpose: analyses draw in declaration order, so the heatmap
+        # goes under the counting lines and lane overlays drawn after it.
+        "heatmap": {
+            "enabled": False,
+            "groups": ["person", "vehicle"], "show": "all",
+            "grid_w": 96, "blur": 1.5, "half_life_s": 0,
+            "alpha": 0.45, "min_level": 0.08, "scale": "log", "colormap": "jet",
+            "redraw_every": 5, "draw": True, "save": True,
+            "background_every": 150, "dir": "outputs/{camera_id}/heatmap",
+        },
         "counting": {
             "enabled": True,
             "vehicles_only": True,

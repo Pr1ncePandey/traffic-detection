@@ -103,4 +103,4 @@ def _load_builtins():
     _loaded = True
     # Attribute readers are NOT here any more: `anpr` and `color` moved to
     # attributes/enrichers/ and run in the perception stage, ahead of these.
-    from . import congestion, counting, lanes  # noqa: F401
+    from . import congestion, counting, heatmap, lanes  # noqa: F401

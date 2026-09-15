@@ -240,6 +240,26 @@ perception:
 # the others. Congestion, wrong-way and counting do not know about each other.
 # ===========================================================================
 analyses:
+  heatmap:               # colour where people and vehicles are most (their
+    enabled: false       # ground point, every frame). Turn on per camera or:
+                         #   python main.py --camera demo --enable heatmap
+                         # First in this list so it draws UNDER lines and boxes.
+    groups: [person, vehicle]  # detector groups to count (also: animal, obstacle)
+    show: all            # what the video shows: all, or one of the groups
+    grid_w: 96           # grid columns (rows follow the aspect ratio)
+    blur: 1.5            # smoothing, in grid cells
+    half_life_s: 0       # 0 = whole run (a clip); e.g. 120 = last few minutes
+                         # fade in (a live camera)
+    alpha: 0.45          # how strongly the colour covers the video
+    min_level: 0.08      # below this share of the busiest spot: no colour
+    scale: log           # log keeps rarely-visited spots visible next to a
+                         # queue or parked car; linear = busiest spot only
+    colormap: jet        # jet | turbo | hot | inferno
+    redraw_every: 5      # rebuild the colour layer every N frames
+    draw: true           # show it on the output video
+    save: true           # at the end: PNGs + raw grid under dir
+    background_every: 150  # frames between updates of the saved backdrop
+    dir: "outputs/{camera_id}/heatmap"
   counting:
     enabled: true
     vehicles_only: true  # count vehicles only, not people/animals

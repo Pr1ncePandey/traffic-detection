@@ -813,6 +813,25 @@ python main.py --camera indian_road --enable face    # or switch it on for one r
 - **Consent.** Enrol only people who agreed. `people/`, `samples/faces/`
   and `models/faces/` are gitignored.
 
+### Heatmap
+
+Colours the places where people and vehicles are most, over the video. Like
+congestion it is an analysis that is off until you turn it on:
+
+```bash
+python main.py --camera demo --enable heatmap
+```
+
+or `analyses.heatmap.enabled: true` in a camera file. Each frame, every person
+and vehicle adds heat where it stands (the bottom centre of its box), so places
+where people gather or vehicles queue turn red. `show: person` or
+`show: vehicle` limits the video to one group; `half_life_s: 120` makes old
+activity fade (for live cameras). At the end of a run
+`outputs/<camera>/heatmap/` holds `heatmap_all.png`, one PNG per group and the
+raw grid (`heatmap_grid.npz`). This is the map only - zones, dwell times and
+"where do people go" come later; see `docs/heatmap.md` for the plan and the
+use cases by sector.
+
 ## Setup and usage
 
 Python 3.10+. A virtual environment is required on macOS with Homebrew Python (PEP 668):
