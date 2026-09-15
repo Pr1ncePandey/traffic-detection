@@ -210,8 +210,11 @@ DEFAULTS = {
         },
         # Human behaviour (analysis/behaviour.py): named zones and the rules
         # that watch them - intrusion, loitering, crowding, running. No model:
-        # it reads the same tracks every other analysis does. OFF fleet-wide;
-        # a camera draws its own zones and switches it on. Polygons are ratios
+        # it reads the same tracks every other analysis does. OFF, and NOT a
+        # camera setting: a camera file's block is ignored (_strip_behaviour).
+        # It runs only when asked, with a zones file kept outside cameras/:
+        #   python main.py --camera X --behaviour behaviour/<name>.yaml
+        # (apply_behaviour). The keys below are that file's. Polygons are ratios
         # or pixels like lanes; a zone with no polygon is the whole frame.
         # Per-zone rules: restricted, loitering_s, crowd_people (0/false = off).
         # See docs/human-behaviour.md for why each threshold is what it is.
@@ -420,6 +423,51 @@ def _strip_locked(raw: dict, camera_id: str) -> dict:
     return cleaned
 
 
+def _strip_behaviour(raw: dict, camera_id: str) -> dict:
+    """Behaviour is never set up in a camera file.
+
+    The owner does not want the behaviour analysis attached to cameras, so no
+    camera - and therefore no serve.py worker - runs it on its own. It runs
+    only when an operator asks for it with --behaviour and a zones file (see
+    apply_behaviour). A camera file carrying the block is told so and the block
+    is dropped, rather than half-working or silently vanishing.
+    """
+    cleaned = dict(raw or {})
+    if _pop(cleaned, "analyses.behaviour"):
+        print(f"[config] cameras/{camera_id}.yaml sets 'analyses.behaviour', but "
+              f"behaviour is not a camera setting; ignoring it. Run it with "
+              f"--behaviour behaviour/<name>.yaml")
+    return cleaned
+
+
+def apply_behaviour(cfg: dict, path: str) -> dict:
+    """Switch the behaviour analysis on for one run, with zones from `path`.
+
+        python main.py --camera person_test --behaviour behaviour/person_test.yaml
+
+    The file holds what would otherwise be an `analyses.behaviour` block -
+    zones, exclude masks, any threshold overrides - at its top level. Kept in
+    behaviour/, not cameras/, because behaviour is not a camera setting
+    (_strip_behaviour). Changes `cfg` in place and returns it.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"behaviour file not found: {path}")
+    raw = _read_yaml(path) or {}
+    known = DEFAULTS["analyses"]["behaviour"]
+    for key in raw:
+        if key not in known:
+            print(f"[config] {path}: unknown behaviour key {key!r} "
+                  f"(no such setting); ignoring")
+    analyses = cfg.setdefault("analyses", {})
+    block = _merge(analyses.get("behaviour") or {},
+                   {k: v for k, v in raw.items() if k in known})
+    block["enabled"] = True
+    analyses["behaviour"] = block
+    print(f"[config] {path}: behaviour on, {len(block.get('zones') or [])} zone(s), "
+          f"{len(block.get('exclude') or [])} exclude mask(s)")
+    return cfg
+
+
 def _known_paths() -> set:
     """Dotted paths DEFAULTS declares.
 
@@ -527,7 +575,8 @@ def load_for_camera(camera_id: str | None = None,
             raw = _read_yaml(cam_path)
             _warn_unknown(raw, camera_id)
             _note_overrides(raw, camera_id)
-            cfg = _merge(cfg, _strip_locked(raw, camera_id))
+            cfg = _merge(cfg, _strip_locked(_strip_behaviour(raw, camera_id),
+                                            camera_id))
             applied = sorted({p.split(".")[0] for p, _ in _walk(raw)})
             print(f"[config] {cam_path}: applied {', '.join(applied) or 'nothing'}")
         cfg.setdefault("camera", {})["id"] = camera_id

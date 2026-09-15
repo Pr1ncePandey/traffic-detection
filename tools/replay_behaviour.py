@@ -1,13 +1,14 @@
 """Replay a finished run's detections through the behaviour analysis.
 
-    python tools/replay_behaviour.py --db outputs/behaviour_demo/behaviour.db \
-        --camera behaviour_demo [--sheet outputs/behaviour_demo/replay]
+    python tools/replay_behaviour.py --db outputs/person_test/behaviour.db \
+        --camera person_test --behaviour behaviour/person_test.yaml \
+        [--sheet outputs/person_test/replay]
 
 Detection on CPU is the slow part of a run (7 minutes for a 63 s clip); the
 behaviour rules cost 0.6 ms a frame. Drawing a zone or a mask by eye takes a
 few tries, so re-running YOLO for each try is the wrong loop. This reads the
 boxes a run already stored (detections + frames tables) and feeds them through
-BehaviourAnalyzer with the CURRENT camera config, in seconds.
+BehaviourAnalyzer with the CURRENT zones file, in seconds.
 
 What it cannot replay: boxes the run did not store, and anything that depends
 on pixels. Track ids are the run's object ids, which is what the rules key on.
@@ -28,7 +29,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.analysis.behaviour import BehaviourAnalyzer  # noqa: E402
-from src.config import load_for_camera  # noqa: E402
+from src.config import apply_behaviour, load_for_camera  # noqa: E402
 from src.detectors.classes import group_of  # noqa: E402
 from src.runtime.context import AnalysisView, Detection, TrackedBox  # noqa: E402
 
@@ -104,13 +105,16 @@ def sheet(video, items, path, per_row=8):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--db", required=True)
-    ap.add_argument("--camera", required=True)
+    ap.add_argument("--camera", default=None, help="camera the run used (optional)")
+    ap.add_argument("--behaviour", required=True, metavar="FILE",
+                    help="zones file, behaviour/<name>.yaml")
     ap.add_argument("--video", default=None, help="default: the run's source")
     ap.add_argument("--sheet", default=None, help="folder for contact sheets")
     args = ap.parse_args()
 
     with contextlib.redirect_stdout(io.StringIO()):
         cfg = load_for_camera(args.camera)
+    apply_behaviour(cfg, args.behaviour)
     run, frames, boxes = load(args.db)
     print(f"run {run['id']}: {run['source']} {run['width']}x{run['height']}, "
           f"{len(frames)} frames, {sum(len(v) for v in boxes.values())} boxes")

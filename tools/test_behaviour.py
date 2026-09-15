@@ -9,17 +9,20 @@ along with the incidents the rules raise.
 """
 
 import contextlib
+import copy
 import io
 import os
 import sys
+import tempfile
 
 import numpy as np
+import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.analysis.base import build, enabled_names  # noqa: E402
 from src.analysis.behaviour import BehaviourAnalyzer  # noqa: E402
-from src.config import load_for_camera  # noqa: E402
+from src.config import _strip_behaviour, apply_behaviour, load_for_camera  # noqa: E402
 from src.incidents import NEVER, IncidentPolicy  # noqa: E402
 from src.runtime.context import AnalysisView, Detection, TrackedBox  # noqa: E402
 
@@ -336,13 +339,47 @@ cfg = load_for_camera(None)
 check("behaviour is OFF by default", "behaviour" not in enabled_names(cfg))
 check("background search embeddings stay OFF in config.yaml",
       cfg["server"]["search"]["embed_in_background"] is False)
-demo = load_for_camera("behaviour_demo")
-check("behaviour_demo camera switches it on with 3 zones",
-      "behaviour" in enabled_names(demo) and len(demo["analyses"]["behaviour"]["zones"]) == 3)
+with contextlib.redirect_stdout(io.StringIO()):
+    cam = load_for_camera("person_test")
+check("the person_test camera does NOT run behaviour on its own", "behaviour" not in enabled_names(cam))
+in_cameras = [f for f in os.listdir("cameras") if f.endswith(".yaml")
+              and "behaviour" in ((yaml.safe_load(open(os.path.join("cameras", f), encoding="utf-8")) or {})
+                                  .get("analyses") or {})]
+check("no camera file sets up behaviour", not in_cameras, in_cameras)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    stripped = _strip_behaviour({"analyses": {"behaviour": {"enabled": True}, "lanes": {"enabled": False}}}, "x")
+check("a camera file's behaviour block is dropped, loudly, and the rest of the file kept",
+      "behaviour" not in stripped["analyses"] and "lanes" in stripped["analyses"]
+      and "--behaviour" in buf.getvalue(), buf.getvalue())
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    demo = apply_behaviour(copy.deepcopy(cam), "behaviour/person_test.yaml")
+beh_cfg = demo["analyses"]["behaviour"]
+check("--behaviour FILE switches it on with the file's 3 zones and 2 masks",
+      "behaviour" in enabled_names(demo) and len(beh_cfg["zones"]) == 3 and len(beh_cfg["exclude"]) == 2)
+check("...keeps the defaults the file does not set", beh_cfg["running"]["min_speed_hps"] == 1.6)
+check("...and switches on nothing else", set(enabled_names(demo)) - set(enabled_names(cam)) == {"behaviour"})
 with contextlib.redirect_stdout(io.StringIO()):
     built = build(demo, Source())
 beh = [a for a in built if a.name == "behaviour"]
-check("...and it is built like any analysis", beh and [z.name for z in beh[0].zones] == ["road", "shopfront", "pavement"])
+check("...and it is built like any analysis",
+      bool(beh) and [z.name for z in beh[0].zones] == ["road", "shopfront", "pavement"]
+      and len(beh[0].masks) == 2)
+try:
+    apply_behaviour({}, "behaviour/does_not_exist.yaml")
+    missing = False
+except FileNotFoundError:
+    missing = True
+check("a missing zones file is an error, not a silent no-op", missing)
+with tempfile.TemporaryDirectory() as tmp:
+    typo = os.path.join(tmp, "typo.yaml")
+    with open(typo, "w", encoding="utf-8") as fh:
+        fh.write("zonez: []\n")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        apply_behaviour({}, typo)
+    check("a typo in the zones file says so", "zonez" in buf.getvalue(), buf.getvalue())
 
 print(f"\n{'=' * 60}\n{_passed} passed, {len(_failed)} failed")
 for name in _failed:

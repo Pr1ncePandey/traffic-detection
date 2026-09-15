@@ -1,0 +1,43 @@
+# Behaviour zones for the person_test camera (the rainy pedestrian street,
+# samples/short/person_test.mp4 and samples/long/person_test_long.mp4).
+#
+# NOT a camera file. Behaviour is not set up in cameras/*.yaml, so no camera
+# runs it on its own; it runs only when asked for:
+#
+#   python main.py --camera person_test --source samples/short/person_test.mp4 \
+#       --behaviour behaviour/person_test.yaml --disable plate,color,person
+#
+# This file's keys are the behaviour analysis settings (see config.py,
+# analyses.behaviour). Tuned on the clip - see docs/human-behaviour.md.
+#
+#   road       the carriageway. restricted: a person on it is an intrusion
+#              (jaywalking). Riders and passengers are ignored.
+#   shopfront  under the awning. Loitering after 20 s - deliberately short so a
+#              63 s clip can show it; a real camera would use minutes.
+#   pavement   the paved walkway. A crowd at 4+ people.
+
+# Two fixed objects YOLO keeps calling "person" (up to 0.61 confidence, as high
+# as real people here), found by the first run's contact sheet: the no-parking
+# sign pole on the left median and the blue arrow bollard.
+exclude:
+  - [[0.02, 0.32], [0.08, 0.32], [0.08, 0.39], [0.02, 0.39]]
+  - [[0.51, 0.20], [0.53, 0.20], [0.53, 0.245], [0.51, 0.245]]
+
+zones:
+  - name: "road"
+    # Upper-left edge follows the market stalls' kerb. The first version ran
+    # straight across to the frame edge at y 0.22 and took in the stall
+    # frontage: 6 of 30 intrusions were shoppers at the stalls.
+    polygon: [[0.0, 0.45], [0.17, 0.33], [0.26, 0.198], [0.72, 0.16],
+              [0.72, 0.24], [0.48, 0.40], [0.22, 0.50], [0.0, 0.56]]
+    restricted: true
+  - name: "shopfront"
+    polygon: [[0.74, 0.28], [0.93, 0.28], [0.93, 0.75], [0.80, 0.75]]
+    loitering_s: 20
+  - name: "pavement"
+    polygon: [[0.0, 0.56], [0.22, 0.50], [0.48, 0.40], [0.72, 0.24],
+              [0.80, 0.75], [0.60, 1.0], [0.0, 1.0]]
+    # A DEMO threshold, like loitering_s above. At 5 this pavement never holds
+    # a crowd (best 5 s window: 67% of frames at 5+), so the rule would go
+    # unexercised; a real pavement would use far more.
+    crowd_people: 4

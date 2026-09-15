@@ -27,39 +27,64 @@ Nothing in `pipeline.py` changed. That is the analysis seam doing its job
 |---|---|---|
 | Analysis | `src/analysis/behaviour.py` | zones + four rules, staged (`compute`/`apply`/`draw`), `concurrent = True` |
 | Registration | `src/analysis/base.py` | one import in `_load_builtins` |
-| Defaults | `src/config.py` → `analyses.behaviour` | OFF fleet-wide; a camera turns it on |
+| Defaults | `src/config.py` → `analyses.behaviour` | OFF, and **not a camera setting**: a camera file's block is ignored |
+| Switching it on | `main.py --behaviour FILE` → `config.apply_behaviour` | the only way to run it |
 | Incidents | `src/incidents.py` | new kinds fire at detection; `zone_exit` is never an incident |
 | Dashboard | `src/server/static/app.js` | new kinds in the incident filter |
-| Demo camera | `cameras/behaviour_demo.yaml` | three zones on `samples/short/person_test.mp4` |
+| Zones file | `behaviour/person_test.yaml` | three zones + two masks for the `person_test` camera's street |
 | Tests | `tools/test_behaviour.py` | 80 checks, fabricated boxes, no video |
 | Tuning | `tools/replay_behaviour.py` | re-runs the rules over a finished run's stored boxes in seconds, with contact sheets |
 
+### Not a camera setting
+
+**Decision (from the owner): behaviour is not set up in camera files.** No
+camera runs it on its own, and so no `serve.py` worker and no dashboard camera
+shows it. It still runs normally when asked for:
+
+```bash
+python main.py --camera person_test --behaviour behaviour/person_test.yaml
+```
+
+- **Zones live in `behaviour/<name>.yaml`**, not in `cameras/`.
+  `--behaviour FILE` loads the file and switches the analysis on for that one
+  run (`config.apply_behaviour`).
+- **A camera file that sets `analyses.behaviour` is ignored, loudly.**
+  `config._strip_behaviour` prints why and says to use `--behaviour`; the rest
+  of the camera file still applies. This is tested, along with a check that no
+  file in `cameras/` sets it.
+- **`--camera` still supplies the source and everything else** (detector,
+  attributes, output paths), so behaviour sees the same tracks the camera run
+  would.
+
 ### Configuration
 
+A zones file, `behaviour/<name>.yaml`. Its top-level keys are the behaviour
+settings:
+
 ```yaml
-analyses:
-  behaviour:
-    enabled: true
-    exclude:                      # a sign pole the detector calls "person"
-      - [[0.02, 0.32], [0.08, 0.32], [0.08, 0.39], [0.02, 0.39]]
-    zones:
-      - name: "road"
-        polygon: [[0.0, 0.22], [0.72, 0.16], [0.72, 0.24], [0.0, 0.56]]
-        restricted: true          # intrusion
-      - name: "shopfront"
-        polygon: [[0.74, 0.28], [0.93, 0.28], [0.93, 0.75], [0.80, 0.75]]
-        loitering_s: 120          # loitering
-      - name: "pavement"
-        polygon: [...]
-        crowd_people: 8           # crowd
-      - name: "anywhere"          # no polygon = the whole frame
-        loitering_s: 600
+exclude:                      # a sign pole the detector calls "person"
+  - [[0.02, 0.32], [0.08, 0.32], [0.08, 0.39], [0.02, 0.39]]
+zones:
+  - name: "road"
+    polygon: [[0.0, 0.22], [0.72, 0.16], [0.72, 0.24], [0.0, 0.56]]
+    restricted: true          # intrusion
+  - name: "shopfront"
+    polygon: [[0.74, 0.28], [0.93, 0.28], [0.93, 0.75], [0.80, 0.75]]
+    loitering_s: 120          # loitering
+  - name: "pavement"
+    polygon: [...]
+    crowd_people: 8           # crowd
+  - name: "anywhere"          # no polygon = the whole frame
+    loitering_s: 600
 ```
+
+An unknown key (a typo such as `zonez`) is reported and ignored. A missing file
+is an error.
 
 A zone with no rule still counts entries, occupancy and dwell time. Polygons
 are ratios (0–1) or pixels, the same convention and helpers as `lanes`.
 Fleet-wide knobs (`intrusion_s`, `exit_grace_s`, `crowd_hold_s`, riders,
-`running.*`) are in `config.py` with a comment each.
+`running.*`) are in `config.py` with a comment each, and any of them can be overridden in the zones file.
 
 ## The rules, and why each is shaped like this
 
@@ -235,7 +260,7 @@ held each rule and emits it once, so another gate would only add latency.
 Payload differences from a vehicle incident:
 
 ```json
-{"incident_id": "behaviour_demo-412-road-intrusion",
+{"incident_id": "person_test-412-road-intrusion",
  "kind": "intrusion", "state": "ongoing", "zone": "road",
  "subject": {"group": "person", "cls": "person"},
  "sighting": {"object_id": 412},
@@ -309,7 +334,7 @@ market stalls and shopfronts. It is a downloaded public clip, so this looks only
 at behaviour and identifies nobody.
 
 ```bash
-python main.py --camera behaviour_demo --db outputs/behaviour_demo/behaviour.db --no-frames
+python main.py --camera person_test --source samples/short/person_test.mp4 \n    --behaviour behaviour/person_test.yaml --disable plate,color,person --no-frames
 ```
 
 The run took 432 s on CPU (3.7 fps; YOLO is the cost) and produced 441 tracks,
@@ -385,9 +410,16 @@ its label above the pipeline's, so no pipeline change was needed. Checked on a
 60-frame real run: track 7's red box sits outside its cyan box and
 `INTRUSION road` reads clearly above the pipeline label.
 
-**Incidents on these runs.** `main.py` stores events but does not run the
-incident policy; `serve.py` does. So incident firing (ids, payloads, defaults)
-is covered by the unit tests, not by these runs.
+**Incidents.** `main.py` stores events but does not run the incident policy.
+Only `serve.py` does, and `serve.py` runs cameras from their camera files,
+where behaviour is never set up (see *Not a camera setting*). So today
+behaviour produces **events and the annotated video, not webhooks**. The
+incident kinds and payloads are implemented and unit-tested, ready if behaviour
+alerts are ever wanted in the service.
+
+(These runs were made while the zones still lived in a camera file,
+`cameras/behaviour_demo.yaml`. The zones and results are unchanged by the move
+to `behaviour/person_test.yaml`.)
 
 ## Not done (next steps)
 

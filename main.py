@@ -6,12 +6,13 @@ Run:
   python main.py --camera junction_7 --analyse-fps 5
   python main.py --source rtsp://cam/stream --camera junction_7
   python main.py --camera demo --enable congestion --disable anpr
+  python main.py --camera person_test --behaviour behaviour/person_test.yaml
 """
 
 import argparse
 import copy
 
-from src.config import load_for_camera
+from src.config import apply_behaviour, load_for_camera
 from src.pipeline import run_pipeline
 
 
@@ -45,6 +46,10 @@ def parse_args():
                    help="frames per second to analyse, independent of source rate")
     p.add_argument("--enable", default=None,
                    help="comma list of analyses to switch on for this run")
+    p.add_argument("--behaviour", default=None, metavar="FILE",
+                   help="run the human behaviour analysis with zones from FILE "
+                        "(behaviour/<name>.yaml). Not a camera setting: this "
+                        "flag is the only way to switch it on")
     p.add_argument("--disable", default=None,
                    help="comma list of analyses or attributes to switch off")
     p.add_argument("--parallel", action="store_true",
@@ -123,6 +128,7 @@ def main():
     if args.max_frames is not None: cfg["processing"]["max_frames"] = args.max_frames
     if args.analyse_fps is not None: cfg["processing"]["analyse_fps"] = args.analyse_fps
     if args.parallel: cfg.setdefault("analysis", {})["parallel"] = True
+    if args.behaviour: apply_behaviour(cfg, args.behaviour)
     if args.enable: _toggle(cfg, _names(args.enable), True)
     if args.disable: _toggle(cfg, _names(args.disable), False)
     if args.backpressure: cfg.setdefault("source", {})["backpressure"] = args.backpressure
