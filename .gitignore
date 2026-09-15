@@ -8,8 +8,8 @@ __pycache__/
 .venv/
 venv/
 
-# Auto-downloaded on first run (ultralytics fetches it)
-yolov8n.pt
+# yolov8n.pt (6 MB, Ultralytics, AGPL-3.0) IS committed, so a fresh clone runs
+# without a download. Bigger YOLO weights stay out.
 
 # Heavy ML weights - fetched automatically (HF) or documented in README
 *.safetensors
@@ -17,22 +17,23 @@ yolov8n.pt
 *.onnx
 *.pth
 
-# Third-party PaddleOCR source checkout (runtime dep for paddle_anpr backend;
-# clone with: git clone --depth 1 https://github.com/PaddlePaddle/PaddleOCR.git models/PaddleOCR)
-models/PaddleOCR/
+# models/PaddleOCR/ IS committed: the PaddleOCR source (Apache-2.0, upstream
+# https://github.com/PaddlePaddle/PaddleOCR at 2661c7c) that the paddle_anpr plate
+# backend imports. Committed as plain files, without its own .git.
 
-# Person-attribute model (PP-Human PPLCNet, Apache-2.0) + its ONNX conversion.
-# Fetch with: python tools/fetch_person_attr.py
-models/person_attr/
+# models/person_attr/ IS committed (14 MB): PP-Human PPLCNet weights (Apache-2.0)
+# and their ONNX conversion. Exception to the *.onnx rule above:
+!models/person_attr/person_attr.onnx
 
 # OS junk
 .DS_Store
 Thumbs.db
 
-# SegFormer-B2 clothes (MIT) ONNX export and the MiVOLO source checkout
-# (Apache-2.0; imported for its model code, weights come from HuggingFace).
+# SegFormer-B2 clothes (MIT) ONNX export: 105 MB, stays local.
+# models/MiVOLO/ IS committed: its source (Apache-2.0, upstream
+# https://github.com/WildChlamydia/MiVOLO at 37475e3), without its own .git.
+# Its weights still come from HuggingFace at runtime.
 models/clothes_seg/
-models/MiVOLO/
 
 # CLIP / SigLIP encoders for open-vocabulary search. The *.onnx rule above
 # already covers the weights; these also carry a ~2MB tokenizer.json, and the
