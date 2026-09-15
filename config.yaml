@@ -195,6 +195,44 @@ perception:
       max_reads: 3
       min_reads: 2
       threads: 4
+    face:                # FACE RECOGNITION against the people database (YuNet +
+      enabled: false     # AdaFace IR101, ~250 MB, models/faces/). OFF fleet-wide:
+                         # a camera switches it on (cameras/face_demo.yaml).
+                         # Enrol people: python tools/people.py add NAME PHOTO
+                         # Fetch models: python tools/fetch_face_models.py
+                         # Only enrol people who have agreed to it.
+      models_dir: "models/faces"
+      people: []         # empty = everyone enabled in the database; or names
+      detect_every: 2    # face detection every Nth analysed frame - and only
+                         # while some visible person still needs a check
+      detect_width: 1280 # frames shrunk to this width for detection
+      min_det_score: 0.8
+      min_eye_px: 28     # eyes closer than this = too small to recognise
+      min_sharpness: 40  # skip motion-blurred faces: blurred frames of the
+                         # right person scored 0.07-0.40 in the switch test,
+                         # sharp ones 0.51-0.70
+      face_top: 0.6      # a face must sit in the top 60% of a person box
+      threshold: 0.45    # cosine similarity for a read to count. NOT a
+                         # percentage: same person 0.51-0.70 in video,
+                         # strangers at most 0.27 (docs/face-recognition.md)
+      margin: 0.05       # ...and beat the next enrolled person by this much
+      min_votes: 2       # agreeing reads before a person is named
+      max_reads: 6       # AdaFace runs per unnamed person (~1 s each on CPU)
+      read_gap_s: 0.3    # seconds between two reads of one person
+      recheck_s: 3.0     # re-check a named person this often, to catch the
+                         # tracker swapping two people who cross. 0 = never
+      lost_below: 0.25   # 3 re-checks below this = no longer that person
+      crossing_overlap: 0.3  # two person boxes overlapping this much (of the
+                         # smaller box) = a crossing, where ByteTrack swaps
+                         # ids; both get quick re-checks once apart again
+      threads: 4         # onnxruntime threads for AdaFace
+      batch: 8
+      max_pending: 16    # live sources: queued face checks before new ones
+                         # are skipped instead of stalling the camera
+      embed_async: "auto"  # auto = background thread on live sources, inline
+                           # on files (deterministic); on | off
+      reload_s: 10       # re-read the people database this often
+      snapshot_dir: "outputs/{camera_id}/faces"   # face image per match
 
 # ===========================================================================
 # ANALYSES - independent consumers of the objects perception produced.

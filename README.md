@@ -771,6 +771,48 @@ the crop budget cannot reclaim — so the dashboard reports pinned bytes
 separately from reclaimable ones, to make that floor visible before it is a full
 disk.
 
+### Face recognition
+
+Finds enrolled people - a name plus one or more reference photos - on any
+camera that switches it on, and fires a `face_match` webhook when a person is
+confirmed. YuNet finds faces, AdaFace IR101 recognises them; faces ride on the
+pipeline's own person tracks, so the name lands on the same object as the
+person's crop and clothing attributes. Full decision log and measurements:
+`docs/face-recognition.md`.
+
+```bash
+python tools/fetch_face_models.py                    # once: models/faces/ (~250 MB)
+python tools/people.py add "Prince" people/me/selfie.jpg
+python tools/people.py import people/                # or a whole folder: people/<Name>/*.jpg
+python tools/people.py list
+python main.py --camera face_demo                    # a camera with face: {enabled: true}
+python main.py --camera indian_road --enable face    # or switch it on for one run
+```
+
+- **Per camera.** `perception.attributes.face.enabled` is false fleet-wide;
+  a camera file turns it on, and `people: [names]` limits who that camera
+  looks for (empty = everyone enabled).
+- **The people database** is two tables in the same SQLite file
+  (`people`, `person_photos`). The AdaFace vector of each photo is stored
+  there, so a photo is processed once, not at every camera start. A running
+  camera re-reads the list every `reload_s` seconds. Also editable over the
+  API: `GET/POST /people`, `POST /people/{name}/enabled`, `DELETE /people/{name}`.
+- **Webhook.** One `face_match` incident per confirmed sighting, sent at
+  confirmation (not at track retirement), with a `person` block (name, score,
+  votes) and `image_url` -> `/faces/{object_id}.jpg`. The same person on the
+  same camera within `incidents.face_match_cooldown_s` (60 s) is recorded as
+  an event but not re-sent.
+- **The score is not a percentage.** It is cosine similarity: the same person
+  scored 0.51-0.70 in video, different people at most 0.27. A match is
+  "please check this", not proof.
+- **Cost.** AdaFace is ~1 s per face check on a laptop CPU. Checks are
+  bounded per person, skipped for blurred/small faces, and stop once a person
+  is named (re-checked every `recheck_s`). One or two people at a door is
+  real time; a crowded street is not without a GPU. On live sources the
+  checks run on a background thread so the camera never stalls.
+- **Consent.** Enrol only people who agreed. `people/`, `samples/faces/`
+  and `models/faces/` are gitignored.
+
 ## Setup and usage
 
 Python 3.10+. A virtual environment is required on macOS with Homebrew Python (PEP 668):

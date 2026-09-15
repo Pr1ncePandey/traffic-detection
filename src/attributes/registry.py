@@ -107,9 +107,10 @@ def _load_builtins():
               f"person attribute reading disabled")
 
 
-# Experimental, heavier person models. Imported only when a config switches
-# them on, so a machine without torch/transformers never pays for the import.
-OPTIONAL = ("garments", "age_gender")
+# Experimental or heavier person models. Imported only when a config switches
+# them on, so a machine without torch/transformers (or without the face
+# models) never pays for the import.
+OPTIONAL = ("garments", "age_gender", "face")
 
 
 def _load_optional(names):

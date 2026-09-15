@@ -52,6 +52,8 @@ TIMESTAMP_TOLERANCE_S = 300
 # Keys the payload contract promises. Present even when null.
 ALWAYS = ("incident_id", "kind", "state", "camera", "detected_at", "detail")
 PER_VEHICLE = ("vehicle", "sighting", "image_url")
+# face_match describes a recognised person, so it carries `person`, not `vehicle`.
+PER_PERSON = ("person", "sighting", "image_url")
 
 RECEIVED = []            # newest last
 SEEN_IDS = {}            # incident_id -> times received
@@ -93,7 +95,9 @@ def inspect(headers: dict, raw: bytes) -> dict:
         notes.append("missing or non-numeric X-Timestamp")
 
     missing = [k for k in ALWAYS if k not in payload]
-    if payload.get("kind") != "congestion":
+    if payload.get("kind") == "face_match":
+        missing += [k for k in PER_PERSON if k not in payload]
+    elif payload.get("kind") != "congestion":
         missing += [k for k in PER_VEHICLE if k not in payload]
     if headers.get("x-incident-id") not in (None, payload.get("incident_id")):
         notes.append("X-Incident-Id header disagrees with the body")

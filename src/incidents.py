@@ -63,10 +63,13 @@ NEVER = {
     "track_retired": "the trigger for other incidents, not one itself",
     "color_read": "an attribute enricher reporting a fact",
     "clothes_read": "an attribute enricher reporting a fact",
+    "person_read": "an attribute enricher reporting a fact",
+    "face_unmatched": "a correction to an earlier face match - kept as an event, "
+                      "because a retraction webhook nobody asked for is noise",
 }
 
 DEFAULT_KINDS = {"wrong_way": True, "congestion": True,
-                 "wrong_lane": False, "crossing": False}
+                 "wrong_lane": False, "crossing": False, "face_match": True}
 
 # Kept out of the payload's `detail` block: either projected into a dedicated
 # block already, or a local path a remote consumer cannot use.
@@ -74,6 +77,8 @@ _DETAIL_STRIP = frozenset({
     "object_id", "identity_id", "identity_kind", "plate", "plate_conf",
     "cls_name", "colour",
     "first_seen_s", "last_seen_s", "frames_seen", "crop_path",
+    # face_match: projected into the `person` block, or a local file path.
+    "person", "score", "votes", "reads", "snapshot_path",
 })
 
 CONGESTED = "congested"
@@ -179,8 +184,10 @@ class IncidentPolicy:
         self.store = store
         # camera id -> {"name","lat","lon"}; used to stamp location on payloads.
         self.cameras = dict(cameras or {})
+        self.face_cooldown_s = float(inc.get("face_match_cooldown_s", 60))
         self.raised = 0
         self.suppressed = 0
+        self.face_suppressed = 0
 
         # Per-track: which (track, kind) pairs have already fired, when a
         # track's flag was first seen (for the force-fire dwell), and the
@@ -196,6 +203,9 @@ class IncidentPolicy:
         self._evidence: dict = {}
         # Per-camera congestion state machine.
         self._congestion: dict = {}
+        # (camera, person) -> when a face_match last fired. Bounded by the
+        # number of enrolled people per camera, not by traffic.
+        self._face_last: dict = {}
 
     # --- policy questions --------------------------------------------------
     def is_incident(self, kind: str) -> bool:
@@ -227,6 +237,8 @@ class IncidentPolicy:
             return self._on_congestion(event, ctx)
         if kind == "track_retired":
             return self._on_retire(event, ctx)
+        if kind == "face_match":
+            return self._on_face(event, ctx)
         if self.is_incident(kind):
             return self._on_flag(event, ctx, kind, camera)
         return []
@@ -347,6 +359,41 @@ class IncidentPolicy:
                             created_at=now,
                             id_stamp=state["since"])]
 
+    def _on_face(self, event, ctx) -> list:
+        """A person from the people database was recognised: fire NOW.
+
+        Unlike the per-vehicle kinds this does not wait for retirement. The
+        face enricher only emits once a name is confirmed (several agreeing
+        reads), so the payload is already complete, and "who just walked in"
+        loses its value by the time a track retires.
+
+        The cooldown is per (camera, person). A person briefly hidden comes
+        back as a new track and is confirmed again; that sighting is in the
+        events table, but a second webhook seconds after the first is noise.
+        A clock that went BACKWARDS is a new run of a file source (clip time
+        restarts at 0), so it is treated as a fresh sighting, not a repeat.
+        """
+        if not self.is_incident("face_match"):
+            return []
+        detail = event.get("detail") or {}
+        person = str(detail.get("person") or "")
+        if not person:
+            return []
+        camera = ctx.get("camera") or ""
+        now = float(event.get("ts") or ctx.get("timestamp") or 0.0)
+        key = (camera, person.casefold())
+        last = self._face_last.get(key)
+        if last is not None and 0.0 <= now - last < self.face_cooldown_s:
+            self.face_suppressed += 1
+            return []
+        self._face_last[key] = now
+        object_id = ctx.get("object_id")
+        payload = self._payload("face_match", camera, object_id, None,
+                                evidence=detail, sighting=detail,
+                                detected_at=now, state="confirmed")
+        return [self._raise("face_match", camera, object_id, None, payload,
+                            created_at=time.time())]
+
     def congestion_state(self, camera: str) -> str:
         return (self._congestion.get(camera) or {}).get("published", CLEAR)
 
@@ -366,8 +413,13 @@ class IncidentPolicy:
         block would invite a consumer to go looking for one.
         """
         cam = self.cameras.get(camera) or {}
+        id_tail = object_id
+        if kind == "face_match" and object_id is not None:
+            # A tracker swap can put a SECOND name on one object; each name is
+            # its own incident, so the id carries the person too.
+            id_tail = f"{object_id}-{_slug((sighting or {}).get('person'))}"
         body = {
-            "incident_id": incident_id(camera, kind, object_id, detected_at),
+            "incident_id": incident_id(camera, kind, id_tail, detected_at),
             "kind": kind,
             "state": state,
             "camera": {"id": camera, "name": cam.get("name") or camera,
@@ -381,7 +433,23 @@ class IncidentPolicy:
         }
         if dwell_s is not None:
             body["dwell_s"] = round(float(dwell_s), 2)
-        if kind != "congestion":
+        if kind == "face_match":
+            # A person subject, so a `person` block rather than the vehicle
+            # block relabelled. score is cosine similarity, NOT a probability:
+            # same person scored 0.51-0.70 in testing, strangers at most 0.27
+            # (docs/face-recognition.md). Treat a match as "please check".
+            sighting = sighting or {}
+            body["person"] = {"name": sighting.get("person"),
+                              "score": sighting.get("score"),
+                              "votes": sighting.get("votes"),
+                              "reads": sighting.get("reads")}
+            body["sighting"] = {"object_id": object_id}
+            body["image_url"] = (
+                f"{self.base_url}/faces/{object_id}.jpg"
+                if self.base_url and object_id is not None
+                and sighting.get("snapshot_path")
+                else None)
+        elif kind != "congestion":
             sighting = sighting or {}
             # Block still named `vehicle`: it carries plate/colour/cls, and
             # every incident kind today is a vehicle or scene concern. A person
@@ -429,11 +497,17 @@ class IncidentPolicy:
     def stats(self) -> dict:
         return {"enabled": self.enabled, "raised": self.raised,
                 "suppressed_duplicates": self.suppressed,
+                "face_matches_in_cooldown": self.face_suppressed,
                 "kinds_on": sorted(k for k, v in self.kinds.items() if v),
                 "subscriptions": [s.describe() for s in self.subscriptions],
                 "tracked_flags": len(self._flagged_since),
                 "congestion": {c: s["published"]
                                for c, s in self._congestion.items()}}
+
+
+def _slug(text) -> str:
+    out = "".join(c if c.isalnum() else "_" for c in str(text or "").strip())
+    return out.strip("_").lower() or "unknown"
 
 
 def serialise(payload: dict) -> bytes:

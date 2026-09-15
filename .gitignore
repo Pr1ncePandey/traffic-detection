@@ -61,3 +61,10 @@ samples/model_test.mp4
 __MACOSX/
 .code-review-graph/
 .claude/settings.local.json
+
+# Face recognition. The models are ~250 MB and reproducible with
+#   python tools/fetch_face_models.py
+# Reference photos and test clips are of REAL, CONSENTING people: never pushed.
+models/faces/
+people/
+samples/faces/

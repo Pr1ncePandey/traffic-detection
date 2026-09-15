@@ -85,3 +85,11 @@ rapidocr-onnxruntime<2   # <2 matters: 2.x renamed the package and changed its r
 # transformers==4.51.0
 # timm==0.9.2
 # accelerate==1.8.1
+
+# Face recognition (`face` enricher, off unless a camera enables it) needs only
+# opencv-python >= 4.8 (cv2.FaceDetectorYN) and onnxruntime - both already
+# pulled in above. Models, once:  python tools/fetch_face_models.py
+# That one-off AdaFace export additionally needs:
+#   torch  safetensors  huggingface_hub  onnx
+# Optional, for iPhone .heic reference photos:
+#   pillow-heif

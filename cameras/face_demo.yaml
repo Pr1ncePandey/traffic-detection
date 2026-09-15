@@ -1,0 +1,35 @@
+# FACE RECOGNITION test camera.
+#
+# Consented footage only: the clip (samples/faces/) and the reference photos
+# (people/) stay on this machine - both folders are gitignored. Enrol people
+# first, then run:
+#
+#   python tools/people.py import people/
+#   python main.py --camera face_demo
+#   python main.py --camera face_demo --source samples/faces/room_entry.mp4
+#
+# Road analyses are off: nothing here is traffic. Person attributes stay on,
+# so a recognised person also gets clothing attributes on the same object.
+camera:
+  name: "face_demo"
+
+video:
+  source: "samples/faces/switch_test.mp4"
+
+analyses:
+  counting:
+    enabled: false
+  lanes:
+    enabled: false
+  congestion:
+    enabled: false
+
+perception:
+  attributes:
+    plate:
+      enabled: false
+    color:
+      enabled: false
+    face:
+      enabled: true
+      people: []         # empty = everyone enabled in the people database

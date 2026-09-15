@@ -44,7 +44,8 @@ import os
 import threading
 import time
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import (Body, FastAPI, HTTPException, Query, WebSocket,
+                     WebSocketDisconnect)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
@@ -432,6 +433,70 @@ def create_app(cameras: list, config_path: str = "config.yaml",
             # photographed, and conflating them hides a reaper misconfigured
             # to unpin incident crops.
             raise HTTPException(410, f"crop for object {object_id} has been reaped")
+        return FileResponse(path, media_type="image/jpeg")
+
+
+    # --- people (face recognition) ----------------------------------------
+    # The database of who to look for: a name plus reference photo paths.
+    # Cameras with `face` enabled re-read it every reload_s seconds, so a
+    # person added here is searched for without restarting anything. Photo
+    # paths are paths ON THIS MACHINE; the server reads them, never serves them.
+    def _people():
+        from ..faces.people import PeopleDB
+        return PeopleDB(server.store.path)
+
+    @app.get("/people")
+    def list_people():
+        return {"people": _people().list()}
+
+    @app.post("/people")
+    def add_person(body: dict = Body(..., examples=[
+            {"name": "Prince", "photos": ["people/me/selfie.jpg"]}])):
+        """Add a person, or more photos to an existing person."""
+        from ..faces.errors import FaceError
+        photos = body.get("photos") or ([body["photo"]] if body.get("photo") else [])
+        if isinstance(photos, str):
+            photos = [photos]
+        try:
+            return _people().add(body.get("name"), photos)
+        except FaceError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/people/{name}/enabled")
+    def set_person_enabled(name: str, on: bool = True):
+        from ..faces.errors import FaceError
+        try:
+            return _people().set_enabled(name, on)
+        except FaceError as e:
+            raise HTTPException(404, str(e))
+
+    @app.delete("/people/{name}")
+    def remove_person(name: str):
+        from ..faces.errors import FaceError
+        try:
+            removed = _people().remove(name)
+        except FaceError as e:
+            raise HTTPException(400, str(e))
+        if not removed:
+            raise HTTPException(404, f"no person named {name!r}")
+        return {"removed": name}
+
+    @app.get("/faces/{object_id}.jpg")
+    def face_snapshot(object_id: int):
+        """The face snapshot of an object's latest face match: a webhook's image_url."""
+        conn = server.store.connect_ro()
+        try:
+            row = conn.execute("SELECT detail_json FROM events WHERE kind='face_match'"
+                               " AND object_id=? ORDER BY id DESC LIMIT 1",
+                               (object_id,)).fetchone()
+        finally:
+            conn.close()
+        detail = _loads(row["detail_json"]) if row else None
+        path = detail.get("snapshot_path") if isinstance(detail, dict) else None
+        if not path:
+            raise HTTPException(404, f"no face snapshot for object {object_id}")
+        if not os.path.exists(path):
+            raise HTTPException(410, f"face snapshot for object {object_id} was deleted")
         return FileResponse(path, media_type="image/jpeg")
 
     # --- video ------------------------------------------------------------

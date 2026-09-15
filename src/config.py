@@ -65,7 +65,8 @@ NOTED_KEYS = (
 # Paths templated per camera so 50 processes cannot overwrite each other.
 # storage.path is deliberately NOT here: the database is shared by design.
 _PATH_KEYS = ("video.target", "video.csv", "video.summary",
-              "frames.dir", "objects.crop_dir")
+              "frames.dir", "objects.crop_dir",
+              "perception.attributes.face.snapshot_dir")
 
 DEFAULTS = {
     # Identity. `id` is the cameras/<id>.yaml stem and the {camera_id} used in
@@ -137,6 +138,21 @@ DEFAULTS = {
                            "min_height": 100, "min_width": 35,
                            "read_every": 6, "max_reads": 3, "min_reads": 2,
                            "threads": 4},
+            # Face recognition against the people database (src/faces/).
+            # OFF fleet-wide; a camera switches it on. `people` empty = search
+            # for everyone enabled in the database, else only these names.
+            "face": {"enabled": False,
+                     "models_dir": "models/faces", "people": [],
+                     "detect_every": 2, "detect_width": 1280,
+                     "min_det_score": 0.8, "min_eye_px": 28,
+                     "min_sharpness": 40, "face_top": 0.6,
+                     "threshold": 0.45, "margin": 0.05, "min_votes": 2,
+                     "max_reads": 6, "read_gap_s": 0.3, "recheck_s": 3.0,
+                     "lost_below": 0.25, "crossing_overlap": 0.3,
+                     "threads": 4, "batch": 8,
+                     "max_pending": 16, "embed_async": "auto",
+                     "reload_s": 10.0,
+                     "snapshot_dir": "outputs/{camera_id}/faces"},
         },
     },
 
@@ -267,7 +283,14 @@ DEFAULTS = {
         # crossing is deliberately false and would be wrong to enable: it fires
         # for EVERY vehicle, so it is a counter rather than an incident.
         "kinds": {"wrong_way": True, "congestion": True,
-                  "wrong_lane": False, "crossing": False},
+                  "wrong_lane": False, "crossing": False,
+                  "face_match": True},
+        # A recognised person fires AT CONFIRMATION, not at retirement: the
+        # name is settled then, and "who just walked in" is worth nothing
+        # five seconds late. The same person on the same camera again within
+        # this many seconds (a track split by an occlusion, walking out and
+        # straight back) is recorded as an event but not re-sent.
+        "face_match_cooldown_s": 60,
         # One incident fans out to every matching subscription, each with its
         # own deliveries row - so retries and dead-lettering are per subscriber
         # and one broken consumer cannot delay another. Absent or empty filters

@@ -290,6 +290,15 @@ class PluginStage:
         return out
 
     def close(self):
+        # A plugin may own a thread of its own (the face enricher's AdaFace
+        # worker on a live source); it gets the chance to stop it here.
+        for plugin in self.analyzers:
+            closer = getattr(plugin, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as e:
+                    print(f"[{self.label}] {plugin.name} failed to close: {e}")
         if self._pool is not None:
             self._pool.shutdown(wait=True)
             self._pool = None

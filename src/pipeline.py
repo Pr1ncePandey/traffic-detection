@@ -97,6 +97,9 @@ def _label(det, store=None):
     plate = det.extra.get("plate_number")
     if plate:
         tag += f" {plate}"
+    face = det.extra.get("face_name")
+    if face:
+        tag += f" {face} {float(det.extra.get('face_name_conf') or 0.0):.2f}"
     return tag
 
 

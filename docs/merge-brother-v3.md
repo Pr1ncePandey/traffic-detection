@@ -153,3 +153,6 @@ into the main project later - the agreed plan"). Relevant to it from this
 merge: identities are now class-agnostic (a person can hold an
 `identity_id`), crops and the `embeddings` table are the natural home for
 face vectors, and each camera's config already selects its analyses.
+
+**Update (2026-09-15):** integrated on branch `face-recognition` - see
+`docs/face-recognition.md`.
